@@ -1,21 +1,22 @@
-## Methodological Framework & Experimental Setup
+# Cross-Genomic Deep Learning Benchmark Framework
 
 This repository implements a multi-domain benchmark to evaluate how diverse deep learning paradigms generalize across heterogeneous genomic sequence classification tasks directly from raw nucleotide sequences without manual feature extraction.
 
 ---
 
-### Research Objective
+## Research Objective
 
 While domain-specific models demonstrate strong performance in specialized genomic tasks, there remains a critical need for a systematic comparative analysis evaluating the trade-offs between **convolutional local motif extraction** and **attention-based global contextual modeling**.
 
 The primary objective of this project is to benchmark pure CNNs, multi-branch hybrid architectures, and Transformer models across:
+
 * **Diverse Sequence Lengths & Biological Contexts**: Ranging from short 81 bp regulatory elements to 300 bp metagenomic fragments.
 * **Out-of-Distribution (OOD) Generalization**: Assessing model performance when encountering completely unseen viral taxonomic families.
 * **Sequencing Error Robustness**: Measuring accuracy degradation under synthetic mutation/corruption noise levels (1%, 5%, 10%).
 
 ---
 
-### Evaluated Neural Architectures
+## Evaluated Neural Architectures
 
 We benchmark three distinct architectural paradigms, representing different trade-offs in motif locality, base frequency modeling, and attention mechanisms:
 
@@ -27,43 +28,51 @@ We benchmark three distinct architectural paradigms, representing different trad
 
 ---
 
-### Experimental Strategy: Configuration Cross-Benchmarking
+## Experimental Strategy: Configuration Cross-Benchmarking
 
-To evaluate both **native optimization** and **cross-paradigm adaptability**, each architecture is systematically trained and evaluated under **three distinct configuration strategies ($C_1, C_2, C_3$)**. Each configuration reflects the native loss, optimization, learning rate schedule, and data augmentation strategy of one of the baseline models:
+To evaluate both **native optimization** and **cross-paradigm adaptability**, each architecture is systematically trained and evaluated under **three distinct configuration strategies ($C_1, C_2, C_3$)**.
+
+Each configuration reflects the native loss, optimization, learning rate schedule, and data augmentation strategy of one of the baseline models:
 
 ```text
-                  ┌───────────────────────────────────────────────┐
-                  │           Evaluation Architectures           │
-                  │   [ ViraExplorer | FullE | Nucleic-Trans. ]   │
-                  └───────────────────────┬───────────────────────┘
-                                          │
-       ┌──────────────────────────────────┼──────────────────────────────────┐
-       ▼                                  ▼                                  ▼
-┌──────────────┐                   ┌──────────────┐                   ┌──────────────┐
-│ Config A (C1)│                   │ Config B (C2)│                   │ Config C (C3)│
-│ ViraExplorer │                   │    FullE     │                   │  Nucleic-Tr. │
-│    Native    │                   │    Native    │                   │    Native    │
-└──────────────┘                   └──────────────┘                   └──────────────┘
+                 ┌───────────────────────────────────────────────┐
+                 │           Evaluation Architectures            │
+                 │   [ ViraExplorer | FullE | Nucleic-Trans. ]   │
+                 └───────────────────────┬───────────────────────┘
+                                         │
+        ┌────────────────────────────────┼────────────────────────────────┐
+        ▼                                ▼                                ▼
+┌──────────────┐                  ┌──────────────┐                  ┌──────────────┐
+│ Config A (C1)│                  │ Config B (C2)│                  │ Config C (C3)│
+│ ViraExplorer │                  │    FullE     │                  │  Nucleic-Tr. │
+│    Native    │                  │    Native    │                  │    Native    │
+└──────────────┘                  └──────────────┘                  └──────────────┘
+````
 
-```
+### Configuration Specifications
 
-#### Configuration Specifications
+### 1. Configuration A ($C_1$ – ViraExplorer Strategy)
 
-##### 1. Configuration A ($C_1$ – ViraExplorer Strategy)
 * **Optimization Goal**: Maximizes class-imbalance resilience and multi-branch feature learning.
 * **Loss Function**: Focal Loss ($\alpha = 0.75, \gamma = 2.0$) with Label Smoothing ($\epsilon = 0.05$).
 * **Optimizer & Schedule**: AdamW ($lr_{\text{backbone}} = 1\times 10^{-4}$, $lr_{\text{transformer}} = 5\times 10^{-5}$, weight decay $= 1\times 10^{-4}$) with a 5-epoch linear warmup followed by Cosine Annealing.
 * **Data Augmentation**: Stochastic Reverse Complement ($p=0.5$) and random positional sequence shifts within $\pm 5\text{ bp}$.
 * **Training Protocol**: 120 epochs maximum with Early Stopping (patience = 15).
 
-##### 2. Configuration B ($C_2$ – FullE Ensemble Strategy)
+---
+
+### 2. Configuration B ($C_2$ – FullE Ensemble Strategy)
+
 * **Optimization Goal**: Standard multi-branch CNN training scheme.
 * **Loss Function**: Binary Cross-Entropy (BCE) Loss.
 * **Optimizer & Schedule**: Standard Adam ($lr = 1\times 10^{-3}$) with StepLR decay ($\gamma = 0.5$ every 5 epochs).
 * **Data Augmentation**: None (clean baseline sequence input).
 * **Training Protocol**: Fixed 30 epochs without early stopping.
 
-##### 3. Configuration C ($C_3$ – Nucleic Transformer Strategy)
+---
+
+### 3. Configuration C ($C_3$ – Nucleic Transformer Strategy)
+
 * **Optimization Goal**: Attention-focused optimization with token-level noise regularization.
 * **Loss Function**: Cross-Entropy (CE) Loss.
 * **Optimizer & Schedule**: Adam optimizer with Noam (AIAYN) inverse-square-root learning rate schedule and warmup steps.
@@ -72,22 +81,146 @@ To evaluate both **native optimization** and **cross-paradigm adaptability**, ea
 
 ---
 
-### Benchmark Datasets & Tasks
+## Benchmark Datasets & Tasks
 
 Models trained under each configuration are evaluated across a diverse suite of biological tasks:
 
-* **ViraMiner (VM) Metagenomic Benchmark**:
-  * **Task**: Identification of viral contigs from 300 bp NGS human biospecimen reads.
-  * **Challenge**: Severe real-world class imbalance ($\approx 2\%$ viral positive vs $98\%$ host/bacterial background).
+### ViraMiner (VM) Metagenomic Benchmark
 
-* **Bacterial Promoter Recognition ($E.\ coli$)**:
-  * **Task**: Binary classification of 81 bp promoter sequences centered around Transcription Start Sites (TSS), benchmarked on RegulonDB and extended datasets (DNABERT2-CAMP).
+* **Task**: Identification of viral contigs from 300 bp NGS human biospecimen reads.
+* **Challenge**: Severe real-world class imbalance ($\approx 2%$ viral positive vs $98%$ host/bacterial background).
 
-* **Human Enhancer Sequence Benchmark**:
-  * **Task**: Functional annotation of 200 bp enhancer fragments across human cell lines (non-redundant set filtered via CD-HIT).
+### Bacterial Promoter Recognition (*E. coli*)
 
-* **Out-of-Distribution (OOD) Anellovirus Benchmark**:
-  * **Task**: Evaluation of model generalization when sequences from the *Anelloviridae* family are completely excluded from training/validation sets and evaluated exclusively during inference.
+* **Task**: Binary classification of 81 bp promoter sequences centered around Transcription Start Sites (TSS), benchmarked on RegulonDB and extended datasets (DNABERT2-CAMP).
 
-* **Synthetic Noise Robustness (SIM)**:
-  * **Task**: Assessment of error tolerance by injecting uniform substitution noise at 1%, 5%, and 10% mutation levels into test sequences across 5 independent random seeds per corruption level (15 test sets total).
+### Human Enhancer Sequence Benchmark
+
+* **Task**: Functional annotation of 200 bp enhancer fragments across human cell lines (non-redundant set filtered via CD-HIT).
+
+### Out-of-Distribution (OOD) Anellovirus Benchmark
+
+* **Task**: Evaluation of model generalization when sequences from the *Anelloviridae* family are completely excluded from training/validation sets and evaluated exclusively during inference.
+
+### Synthetic Noise Robustness (SIM)
+
+* **Task**: Assessment of error tolerance by injecting uniform substitution noise at 1%, 5%, and 10% mutation levels into test sequences across 5 independent random seeds per corruption level.
+
+---
+
+## Unified Experimental Framework
+
+The repository is organized around three architecture-specific training pipelines:
+
+```bash
+train_vir_pipeline.py
+train_fulle_pipeline.py
+train_nt_pipeline.py
+```
+
+Rather than providing independent training and inference scripts, each pipeline implements the complete experimental workflow for its corresponding architecture.
+
+For every execution, the selected pipeline:
+
+1. **Preprocesses Inputs**: Enforces a strict sequence length standardisation and cleans ambiguous base characters (e.g., `'N'`).
+2. **Trains the Model**: Fits the architecture using one of the three predefined configuration strategies (`A`, `B`, or `C`) on a specified biological task (`--task viral|ecoli|enhancer|anellovirus`).
+3. **Automates Cascade Evaluation**: Automatically evaluates the trained model across all 19 benchmark test sets upon training completion.
+4. **Exports Prediction Logits**: Saves raw prediction logits for every evaluation dataset and purges heavy weight checkpoints to optimize storage.
+
+This unified design ensures that all architectures are evaluated under the exact same experimental protocol while keeping architecture-specific implementations isolated.
+
+---
+
+## Cross-Configuration Evaluation
+
+Each architecture can be executed using any of the three optimization strategies described above.
+
+Consequently, the benchmark supports two complementary analyses:
+
+* **Intra-architecture comparison**: Evaluates how a single architecture behaves under different optimization strategies.
+* **Cross-architecture comparison**: Evaluates different architectures trained under the same optimization strategy.
+
+This design enables a fair assessment of both architectural inductive biases and optimization strategies.
+
+---
+
+## Prediction Logits & Storage Strategy
+
+Instead of storing only aggregate performance metrics or heavy deep learning model weights, every evaluation exports the raw prediction logits directly to a common:
+
+```
+global_logits/
+```
+
+directory using a standardized organization based on:
+
+* **Architecture**
+
+  * `viraexplorer`
+  * `fulle`
+  * `nucleictransformer`
+
+* **Training Configuration**
+
+  * `cfgA`
+  * `cfgB`
+  * `cfgC`
+
+* **Training Task**
+
+  * `ecoli`
+  * `enhancer`
+  * `anellovirus`
+
+* **Evaluation Dataset**
+
+  * `test_VM`
+  * `test_ecoli`
+  * `test_sim_noise_5_seed_5002`
+
+Naming convention:
+
+```text
+{architecture}_cfg{CONFIG}_{task}_{evaluation_dataset}.txt
+```
+
+Saving raw logits rather than only final metrics allows:
+
+* Reproducible post-hoc analyses.
+* Computation of new evaluation metrics without rerunning inference.
+* ROC and Precision–Recall curve generation.
+* Confidence interval estimation via bootstrapping.
+* Decision-level ensemble experiments.
+* Statistical significance testing between models.
+
+The analysis scripts operate directly on the stored logits, making experimentation significantly faster and fully reproducible.
+
+---
+
+## 📐 End-to-End Workflow
+
+```text
+                Select Architecture
+                         │
+                         ▼
+         train_<architecture>_pipeline.py
+                         │
+                         ▼
+              Configuration A / B / C
+                         │
+                         ▼
+                  Model Training
+                         │
+                         ▼
+           Automatic Cascade Evaluation
+             (19 Benchmark Test Sets)
+                         │
+                         ▼
+              Prediction Logits (.txt)
+                         │
+                         ▼
+                  global_logits/
+                         │
+                         ▼
+          Analysis & Benchmarking Scripts
+```
