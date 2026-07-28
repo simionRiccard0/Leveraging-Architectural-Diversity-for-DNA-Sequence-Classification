@@ -213,7 +213,6 @@ The analysis scripts operate directly on the stored logits, making experimentati
                          │
                          ▼
            Automatic Cascade Evaluation
-             (19 Benchmark Test Sets)
                          │
                          ▼
               Prediction Logits (.txt)
