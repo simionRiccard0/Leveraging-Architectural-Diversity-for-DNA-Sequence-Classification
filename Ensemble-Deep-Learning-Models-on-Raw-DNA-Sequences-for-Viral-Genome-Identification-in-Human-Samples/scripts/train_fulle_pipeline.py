@@ -20,7 +20,7 @@ from sklearn.metrics import (
     precision_recall_curve,
 )
 
-# Inserimento path principale del progetto
+# Append project root directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.dataset.csv_dataset import CSVDataset
@@ -56,49 +56,48 @@ BRANCH_KEY_MAP = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="FullE Complete Ensemble Pipeline (10 Models x Config) - DEI Cluster"
+        description="FullE Complete Ensemble Pipeline (10 Models x Config)"
     )
     parser.add_argument(
         "--config",
         type=str,
         required=True,
         choices=["A", "B", "C"],
-        help="Configurazione di training (A, B, C)",
+        help="Training configuration strategy (A, B, C)",
     )
     parser.add_argument(
         "--viraminer_folder",
         default="dataset",
-        help="Path (relativo al repo, es. 'dataset') ai file nativi "
-        "fullset_train/validation/test.csv",
+        help="Path to native fullset_train/validation/test.csv files",
     )
     parser.add_argument(
         "--data_folder",
         "-d",
         default="/home/simionricc/datasets",
-        help="Path alla cartella condivisa con ecoli/enhancer/SIM/unseen_anell",
+        help="Root directory for external benchmark datasets",
     )
     parser.add_argument(
         "--template_dir",
         "-t",
         default="ready_to_train_files/final/onehot",
-        help="Path ai JSON template originali",
+        help="Path to JSON model configuration templates",
     )
     parser.add_argument(
         "--output_dir",
         "-o",
         default="results_fulle_ensemble",
-        help="Directory di output per i checkpoint .ptm",
+        help="Output directory for model checkpoints",
     )
     parser.add_argument(
         "--logits_dir",
         default=None,
-        help="Directory temporanea per i logit estratti (evita race conditions tra job)",
+        help="Target directory for output logit text files",
     )
     return parser.parse_args()
 
 
 # ========================================== #
-# SEED PER RIPRODUCIBILITA' COMPLETA         #
+# SEED FOR REPRODUCIBILITY                   #
 # ========================================== #
 def seed_everything(seed=2020):
     random.seed(seed)
@@ -111,9 +110,10 @@ def seed_everything(seed=2020):
 
 
 # ========================================== #
-# DATA AUGMENTATION ON ONE-HOT TENSORS       #
+# TENSOR-LEVEL DATA AUGMENTATION             #
 # ========================================== #
 def apply_tensor_augmentation(X, augment_type):
+    """Applies augmentation directly on One-Hot encoded PyTorch tensors."""
     if augment_type == "none":
         return X
 
@@ -172,6 +172,7 @@ def apply_tensor_augmentation(X, augment_type):
 
 
 class AugmentedDataLoader:
+    """DataLoader wrapper for online tensor-level data augmentation."""
     def __init__(self, dataloader, augment_type):
         self.dataloader = dataloader
         self.augment_type = augment_type
@@ -199,6 +200,7 @@ class AugmentedDataLoader:
 # LOSS FUNCTIONS                             #
 # ========================================== #
 class ProbabilityFocalLoss(nn.Module):
+    """Focal Loss operating on predicted probabilities."""
     def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.05):
         super().__init__()
         self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
@@ -221,6 +223,7 @@ class ProbabilityFocalLoss(nn.Module):
 
 
 class SafeBCELoss(nn.Module):
+    """Safe Binary Cross-Entropy loss wrapper."""
     def __init__(self):
         super().__init__()
         self.bce = nn.BCELoss()
@@ -230,9 +233,10 @@ class SafeBCELoss(nn.Module):
 
 
 # ========================================== #
-# UTILS NORMALIZZAZIONE DATASET              #
+# DATASET LOADING HELPERS                    #
 # ========================================== #
 def _peek_columns(path):
+    """Detects header and column structure of CSV files."""
     with open(path, "r") as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(",")
@@ -249,6 +253,7 @@ def _peek_columns(path):
 
 
 def _normalize_to_temp_csv(path):
+    """Normalizes dataset layout to standard temporary CSV format."""
     ncols, has_header = _peek_columns(path)
     df = pd.read_csv(path) if has_header else pd.read_csv(path, header=None)
     if df.shape[1] == 2:
@@ -269,6 +274,7 @@ def _normalize_to_temp_csv(path):
 
 
 def make_eval_loader(csv_path, normalize=False):
+    """Creates evaluation DataLoader with One-Hot encoding."""
     if normalize:
         csv_path = _normalize_to_temp_csv(csv_path)
     ds = CSVDataset(csv_path, transform="onehot_encoding")
@@ -276,9 +282,10 @@ def make_eval_loader(csv_path, normalize=False):
 
 
 def _find_single_csv(folder, label):
+    """Finds test CSV file in directory."""
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if len(all_csvs) == 0:
-        print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.")
+        print(f"[SKIP] '{label}': No CSV found in {folder}.")
         return None
     test_csvs = [f for f in all_csvs if "test" in os.path.basename(f).lower()]
     if test_csvs:
@@ -287,15 +294,17 @@ def _find_single_csv(folder, label):
 
 
 def _find_json_config(folder_path):
+    """Finds JSON configuration file for model definitions."""
     json_files = sorted(list(Path(folder_path).glob("*.json")))
     if not json_files:
         raise FileNotFoundError(
-            f"Nessun file .json trovato nella directory: {folder_path}"
+            f"No .json configuration file found in: {folder_path}"
         )
     return json_files[0]
 
 
 def _sanitize_submodel_name(rel_path):
+    """Sanitizes model relative paths for output filenames."""
     return rel_path.replace("/", "_")
 
 
@@ -361,6 +370,7 @@ def main():
     trained_model_paths = {}
 
     def train_one_network(model_infos, save_path, is_merger=False):
+        """Helper to train a single branch or merger network."""
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         if "parameters" in model_infos:
@@ -368,13 +378,14 @@ def main():
 
         model = create_model(model_infos)
 
+        # Freeze branch parameters during merger training
         if is_merger and isinstance(model, Merger):
             model.set_branches_trainability(False)
             trainable_names = [
                 name for name, p in model.named_parameters() if p.requires_grad
             ]
             print(
-                f"    [CHECK Merger Freezing] Parametri addestrabili: {trainable_names}"
+                f"    [CHECK Merger Freezing] Trainable parameters: {trainable_names}"
             )
 
         loss_fn = (
@@ -445,9 +456,9 @@ def main():
         return save_path
 
     # -------------------------------------------------------------------------
-    # STEP 1: Addestramento / Recupero dei 5 Branch
+    # STEP 1: Train or retrieve 5 Branch networks
     # -------------------------------------------------------------------------
-    print(f"\n[>>>] STEP 1: Addestramento / Recupero dei 5 Branch per Config {args.config}")
+    print(f"\n[>>>] STEP 1: Training / Loading 5 Branch Submodels for Config {args.config}")
     for branch_rel in BRANCHES:
         folder_path = Path(args.template_dir) / branch_rel
         json_path = _find_json_config(folder_path)
@@ -457,7 +468,7 @@ def main():
 
         save_ptm = cfg_ckpt_dir / branch_rel / "model.ptm"
         if save_ptm.exists():
-            print(f"  [=] Branch '{branch_rel}' già addestrato. Salto training.")
+            print(f"  [=] Branch '{branch_rel}' already trained. Skipping training.")
         else:
             print(f"  [+] Training Branch: {branch_rel}...")
             train_one_network(model_infos, str(save_ptm), is_merger=False)
@@ -465,9 +476,9 @@ def main():
         trained_model_paths[branch_rel] = str(save_ptm)
 
     # -------------------------------------------------------------------------
-    # STEP 2: Addestramento / Recupero dei 5 Merger
+    # STEP 2: Train or retrieve 5 Merger networks
     # -------------------------------------------------------------------------
-    print(f"\n[>>>] STEP 2: Addestramento / Recupero dei 5 Merger per Config {args.config}")
+    print(f"\n[>>>] STEP 2: Training / Loading 5 Merger Networks for Config {args.config}")
     for merger_rel in MERGERS:
         folder_path = Path(args.template_dir) / merger_rel
         json_path = _find_json_config(folder_path)
@@ -484,7 +495,7 @@ def main():
 
         save_ptm = cfg_ckpt_dir / merger_rel / "model.ptm"
         if save_ptm.exists():
-            print(f"  [=] Merger '{merger_rel}' già addestrato. Salto training.")
+            print(f"  [=] Merger '{merger_rel}' already trained. Skipping training.")
         else:
             print(f"  [+] Training Merger: {merger_rel}...")
             train_one_network(model_infos, str(save_ptm), is_merger=True)
@@ -492,9 +503,9 @@ def main():
         trained_model_paths[merger_rel] = str(save_ptm)
 
     # -------------------------------------------------------------------------
-    # STEP 3: Estrazione Logit (per singolo modello + sum-rule ensemble)
+    # STEP 3: Logit Extraction & Sum-Rule Ensemble
     # -------------------------------------------------------------------------
-    print(f"\n[>>>] STEP 3: Estrazione Logit ed Ensemble per Config {args.config}")
+    print(f"\n[>>>] STEP 3: Logit Extraction and Ensemble for Config {args.config}")
 
     datasets_eval = {"val": dl_valid, "test_VM": dl_test}
 
@@ -533,7 +544,7 @@ def main():
                 model = Branch(ptm_path)
 
             model.eval()
-            # FIX CRITICO: imposta correttamente self.device evitando il mismatch CPU/CUDA
+            # Device configuration to prevent CPU/CUDA tensors mismatch
             model.set_best_available_device()
 
             model_logits = []
@@ -553,7 +564,7 @@ def main():
             model_probs = np.array(model_probs)
             model_logits = np.array(model_logits)
 
-            # SALVATAGGIO 1: Logit grezzo del singolo sotto-modello
+            # Save individual submodel logits
             submodel_tag = _sanitize_submodel_name(rel_path)
             submodel_filename = f"fulle_cfg{args.config}_{submodel_tag}_{dataset_name}.txt"
             np.savetxt(
@@ -572,13 +583,13 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # SALVATAGGIO 2: Ensemble combinato Sum-Rule
+        # Save Sum-Rule ensemble predictions
         ensemble_filename = f"fulle_cfg{args.config}_sumrule_{dataset_name}.txt"
         save_file = os.path.join(LOCAL_LOGITS_DIR, ensemble_filename)
         np.savetxt(save_file, ensemble_probs_sum, fmt="%.6f")
-        print(f"  [✓] Logit dei {num_models} modelli + ensemble sum-rule salvati per '{dataset_name}'")
+        print(f"  [✓] Logits for {num_models} submodels + sum-rule ensemble saved for '{dataset_name}'")
 
-        # Metriche
+        # Metric computation
         if len(y_true_list) == len(ensemble_probs_sum):
             y_true = np.array(y_true_list)
             probs_normalized = ensemble_probs_sum / num_models

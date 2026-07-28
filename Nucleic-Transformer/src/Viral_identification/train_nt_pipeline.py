@@ -19,26 +19,25 @@ from Network import *
 from LrScheduler import *
 
 # ========================================== #
-# 0. COSTANTI METODOLOGICHE GLOBALI          #
+# 0. GLOBAL METHODOLOGICAL CONSTANTS         #
 # ========================================== #
-# Lunghezza fissa standardizzata a 300 bp per tutte le architetture e task
-MAX_LEN = 300
+MAX_LEN = 300  # Strict standardized input sequence length
 
 # ========================================== #
-# 1. PARSING DEGLI ARGOMENTI                 #
+# 1. CLI ARGUMENT PARSING                   #
 # ========================================== #
 parser = argparse.ArgumentParser(
     description="Nucleic Transformer Multi-Task Training Pipeline (DNA Sequence Classification)"
 )
 parser.add_argument('--config', type=str, required=True, choices=['A', 'B', 'C'],
-                     help="Configurazione di training")
+                     help="Training configuration strategy")
 parser.add_argument('--task', type=str, default='viral',
                      choices=['viral', 'ecoli', 'enhancer', 'anellovirus'],
-                     help="Task biologico su cui addestrare il modello (default: viral)")
+                     help="Target biological training task (default: viral)")
 parser.add_argument('--data_folder', '-d', default='/home/simionricc/datasets',
-                     help="Path alla cartella condivisa con ecoli/enhancer/SIM/unseen_anell")
+                     help="Root directory for external benchmark datasets")
 parser.add_argument('--viraminer_folder', default='..',
-                     help="Path ai file nativi fullset_train/validation/test.csv")
+                     help="Path to native fullset_train/validation/test.csv files")
 parser.add_argument('--gpu_id', type=str, default='0')
 parser.add_argument('--ntoken', type=int, default=4)
 parser.add_argument('--ninp', type=int, default=512)
@@ -54,21 +53,21 @@ opts = parser.parse_args()
 args = opts
 
 # ========================================== #
-# 2. MAPPATURA IPERPARAMETRI DELLA TABELLA   #
+# 2. HYPERPARAMETER CONFIGURATIONS           #
 # ========================================== #
-# batch_size=16 per azzerare il rischio OOM sulla Self-Attention
+# Batch size reduced to 16 to contain Self-Attention VRAM usage
 CONFIG_MAP = {
-    'A': {  # Configurazione stile ViraExplorer
+    'A': {  # ViraExplorer Native Strategy
         'epochs': 120, 'early_stop': True, 'patience': 15, 'batch_size': 16,
         'loss': 'focal', 'optimizer': 'adamw', 'lr_sched': 'cosine', 'augment': 'rc_shift',
         'dropout': 0.1, 'nclass': 1
     },
-    'B': {  # Configurazione stile FullE
+    'B': {  # FullE Native Strategy
         'epochs': 30, 'early_stop': False, 'patience': 0, 'batch_size': 16,
         'loss': 'bce', 'optimizer': 'adam', 'lr_sched': 'step', 'augment': 'none',
         'dropout': 0.2, 'nclass': 1
     },
-    'C': {  # Configurazione nativa Nucleic Transformer
+    'C': {  # Nucleic Transformer Native Strategy
         'epochs': 60, 'early_stop': False, 'patience': 0, 'batch_size': 16,
         'loss': 'ce', 'optimizer': 'adam', 'lr_sched': 'aiayn', 'augment': 'mutation',
         'dropout': 0.1, 'nclass': 2
@@ -85,9 +84,10 @@ best_model_path = os.path.join(checkpoints_folder, 'best_model.pt')
 
 
 # ========================================== #
-# 3. HELPER CARICAMENTO DATASET & SPLIT      #
+# 3. DATA LOADING HELPERS                    #
 # ========================================== #
 def _peek_columns(path):
+    """Detects header and column structure of CSV sequence files."""
     with open(path, 'r') as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(',')
@@ -104,6 +104,7 @@ def _peek_columns(path):
 
 
 def load_seq_label_dataframe(path):
+    """Loads CSV file into a standardized DataFrame (index, sequence, label)."""
     ncols, has_header = _peek_columns(path)
     df = pd.read_csv(path) if has_header else pd.read_csv(path, header=None)
     if df.shape[1] == 2:
@@ -118,11 +119,12 @@ def load_seq_label_dataframe(path):
 
 
 def get_task_dataframes(task_name, base_dir, viraminer_folder):
+    """Retrieves train and validation splits for the specified task."""
     if task_name == 'viral':
         train_path = os.path.join(viraminer_folder, "fullset_train.csv")
         val_path = os.path.join(viraminer_folder, "fullset_validation.csv")
 
-        # Fallback automatico se il file non esiste nel percorso relativo
+        # Fallback if relative paths do not exist
         if not os.path.exists(train_path):
             alt_train_dna = os.path.join(base_dir, "DNA_data", "fullset_train.csv")
             alt_val_dna = os.path.join(base_dir, "DNA_data", "fullset_validation.csv")
@@ -143,7 +145,7 @@ def get_task_dataframes(task_name, base_dir, viraminer_folder):
     elif task_name == 'anellovirus':
         train_path = os.path.join(base_dir, "unseen_anell", "training_data_anell_300_binary.csv")
     else:
-        raise ValueError(f"Task non valida: {task_name}")
+        raise ValueError(f"Invalid task: {task_name}")
 
     full_df = load_seq_label_dataframe(train_path)
     full_df = full_df.sample(frac=1, random_state=2020).reset_index(drop=True)
@@ -154,10 +156,10 @@ def get_task_dataframes(task_name, base_dir, viraminer_folder):
 
 
 # ========================================== #
-# 4. DATA AUGMENTATION & CLEANING RIGOROSO   #
+# 4. SEQUENCE SANITIZATION & AUGMENTATION    #
 # ========================================== #
 def clean_and_pad_sequence(seq, target_len=300):
-    """Sostituisce qualsiasi nucleotide non-ACGT (es. 'N') con 'A' e forza la lunghezza a 300 bp."""
+    """Replaces non-ACGT characters (e.g. 'N') with 'A' and enforces strict target length."""
     seq = seq.upper()
     valid_nucs = {'A', 'C', 'G', 'T'}
     cleaned = [b if b in valid_nucs else 'A' for b in seq]
@@ -171,6 +173,7 @@ def clean_and_pad_sequence(seq, target_len=300):
 
 
 def mutate_string_sequence(seq, n_mutations=40):
+    """Applies online random point mutations to string sequences."""
     seq_list = list(seq)
     seq_len = len(seq_list)
     nucleotides = ['A', 'C', 'G', 'T']
@@ -183,6 +186,7 @@ def mutate_string_sequence(seq, n_mutations=40):
 
 
 class ParametricViraminerDataset(Dataset):
+    """Dataset wrapper with online sequence augmentation and length sanitization."""
     def __init__(self, dataframe, augment_type='none'):
         self.sequences = [str(s).upper() for s in dataframe.iloc[:, 1].values]
         self.labels = dataframe.iloc[:, 2].values
@@ -210,19 +214,19 @@ class ParametricViraminerDataset(Dataset):
         elif self.augment_type == 'mutation':
             seq = mutate_string_sequence(seq, n_mutations=40)
 
-        # 2. CLEANING E PADDING RIGOROSO A 300 BP (SENZA 'N')
+        # 2. Strict cleaning and padding to MAX_LEN (ACGT only)
         seq = clean_and_pad_sequence(seq, target_len=MAX_LEN)
 
         temp_ds = ViraminerDataset([seq], [label])
         return temp_ds[0]
 
 
-# Caricamento dati per la task selezionata
 train_df, val_df = get_task_dataframes(args.task, args.data_folder, args.viraminer_folder)
 
 print(f"[i] Task: '{args.task}' | Config: '{args.config}' | Input Length: {MAX_LEN} bp (STRICT ACGT) | "
       f"Train: {len(train_df)} | Val: {len(val_df)}")
 
+# num_workers=0 avoids shared memory issues in container environments
 train_loader = DataLoader(ParametricViraminerDataset(train_df, augment_type=cfg['augment']),
                            batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
 val_loader = DataLoader(ParametricViraminerDataset(val_df, augment_type='none'),
@@ -230,9 +234,10 @@ val_loader = DataLoader(ParametricViraminerDataset(val_df, augment_type='none'),
 
 
 # ========================================== #
-# 5. LOSS FUNCTIONS & SETUP INIZIALE         #
+# 5. LOSS FUNCTIONS & SETUP                  #
 # ========================================== #
 class FocalLoss(nn.Module):
+    """Focal Loss with label smoothing for class imbalance handling."""
     def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.05):
         super().__init__()
         self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
@@ -276,7 +281,7 @@ else:
     scheduler = lr_AIAYN(optimizer, opts.ninp, opts.warmup_steps, opts.lr_scale)
 
 # ========================================== #
-# 6. LOOP DI TRAINING CON SCALER             #
+# 6. TRAINING & VALIDATION LOOP              #
 # ========================================== #
 scaler = GradScaler()
 best_auc = 0
@@ -327,7 +332,7 @@ for epoch in range(cfg['epochs']):
             val_targets.extend(data['labels'].numpy().flatten())
 
     auc = roc_auc_score(val_targets, val_preds)
-    print(f"Epoca {epoch + 1}/{cfg['epochs']} | Loss: {total_loss / len(train_loader):.4f} | Val AUC: {auc:.4f}")
+    print(f"Epoch {epoch + 1}/{cfg['epochs']} | Loss: {total_loss / len(train_loader):.4f} | Val AUC: {auc:.4f}")
 
     if auc > best_auc:
         best_auc = auc
@@ -337,7 +342,7 @@ for epoch in range(cfg['epochs']):
         counter += 1
 
     if cfg['early_stop'] and counter >= cfg['patience']:
-        print("Early stopping attivato.")
+        print("Early stopping triggered.")
         break
 
 if not cfg['early_stop']:
@@ -347,17 +352,18 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
 # ========================================== #
-# 7. VALUTAZIONE IN CASCATA SUI DATASET      #
+# 7. CASCADE EVALUATION & LOGIT EXPORT       #
 # ========================================== #
-print("\nInizio estrazione logit in formato TXT...")
+print("\nStarting logit extraction...")
 model.load_state_dict(torch.load(best_model_path, map_location=device))
 model.eval()
 
 
 def _find_single_csv(folder, label):
+    """Finds test CSV file in directory."""
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if len(all_csvs) == 0:
-        print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.")
+        print(f"[SKIP] '{label}': No CSV found in {folder}.")
         return None
     test_csvs = [f for f in all_csvs if 'test' in os.path.basename(f).lower()]
     if test_csvs:
@@ -373,7 +379,7 @@ def _loader_from_csv(path):
 
 DATASETS_TO_EVAL = {}
 
-# val/test_VM nativi ViraMiner con ricerca fallback
+# Native ViraMiner val/test with fallback paths
 val_native_path = os.path.join(args.viraminer_folder, "fullset_validation.csv")
 test_native_path = os.path.join(args.viraminer_folder, "fullset_test.csv")
 
@@ -394,12 +400,12 @@ if not os.path.exists(test_native_path):
 if os.path.exists(val_native_path):
     DATASETS_TO_EVAL['val'] = _loader_from_csv(val_native_path)
 else:
-    print(f"[SKIP] 'val': path non trovato ({val_native_path}).")
+    print(f"[SKIP] 'val': Path not found ({val_native_path}).")
 
 if os.path.exists(test_native_path):
     DATASETS_TO_EVAL['test_VM'] = _loader_from_csv(test_native_path)
 else:
-    print(f"[SKIP] 'test_VM': path non trovato ({test_native_path}).")
+    print(f"[SKIP] 'test_VM': Path not found ({test_native_path}).")
 
 _ecoli_csv = _find_single_csv(os.path.join(args.data_folder, "ecoli"), "test_ecoli")
 if _ecoli_csv:
@@ -413,7 +419,7 @@ _anell_test = os.path.join(args.data_folder, "unseen_anell", "test_data_anell_30
 if os.path.exists(_anell_test):
     DATASETS_TO_EVAL['test_anellovirus'] = _loader_from_csv(_anell_test)
 else:
-    print(f"[SKIP] 'test_anellovirus': path non trovato ({_anell_test}).")
+    print(f"[SKIP] 'test_anellovirus': Path not found ({_anell_test}).")
 
 _sim_base_dir = os.path.join(args.data_folder, "SIM")
 _sim_files = sorted(glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True))
@@ -440,12 +446,12 @@ with torch.no_grad():
         task_prefix = f"_{args.task}" if args.task != 'viral' else ""
         filename = f"nucleictransformer_cfg{args.config}{task_prefix}_{name}.txt"
         np.savetxt(os.path.join(GLOBAL_LOGITS_DIR, filename), np.array(logits_list), fmt='%.6f')
-        print(f"Logit salvati temporaneamente: {filename}")
+        print(f"Logits saved: {filename}")
 
 # ========================================== #
-# 8. PULIZIA AUTOMATICA DEL CHECKPOINT       #
+# 8. CHECKPOINT CLEANUP                      #
 # ========================================== #
 import shutil
 if os.path.exists(checkpoints_folder):
     shutil.rmtree(checkpoints_folder)
-print("Cartella pesi temporanei rimossa con successo.")
+print("Temporary checkpoints folder removed successfully.")
