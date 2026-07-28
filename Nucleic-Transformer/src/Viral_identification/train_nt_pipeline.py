@@ -70,19 +70,6 @@ CONFIG_MAP = {
 }
 cfg = CONFIG_MAP[args.config]
 
-# NOTA: path locale relativo, non assoluto. Anche questo script gira dentro un
-# container Singularity con bind SOLO su $SLURM_SUBMIT_DIR:/workspace, quindi
-# un path assoluto come /home/simionricc/global_logits non esiste nel
-# filesystem del container. È lo script .slurm che, dopo l'uscita dal
-# container, sposta il contenuto di questa cartella nella directory condivisa
-# globale.
-#
-# FIX: entrambe le cartelle (checkpoint e logit temp) erano condivise tra
-# TUTTE le combinazioni task/config che girano dalla stessa working directory
-# (stesso identico bug di race condition già trovato e risolto in FullE: se
-# due job diversi girano in parallelo e uno finisce prima cancellando la
-# cartella condivisa, l'altro crasha a metà). Ora sono specifiche per
-# task+config, eliminando la collisione.
 GLOBAL_LOGITS_DIR = f"./global_logits_temp_{args.task}_{args.config}"
 os.makedirs(GLOBAL_LOGITS_DIR, exist_ok=True)
 
@@ -112,16 +99,7 @@ def _peek_columns(path):
 
 
 def load_seq_label_dataframe(path):
-    """
-    Autodetect del formato CSV (2 colonne con header 'sequence,label', oppure
-    3 colonne senza header 'id,seq,label'), con normalizzazione uppercase
-    delle sequenze (fix critico: senza questo, sequenze minuscole come
-    ecoli_train_NT.csv verrebbero silenziosamente codificate come nulle da
-    alcuni encoder - stesso bug già trovato e risolto in ViraExplorer/FullE).
-    Restituisce sempre un DataFrame a 3 colonne posizionali [0,1,2] =
-    [id fittizio, sequenza, label], compatibile con ParametricViraminerDataset
-    (che usa iloc[:,1]=seq, iloc[:,2]=label per posizione).
-    """
+    """Autodetect del formato CSV con normalizzazione uppercase delle sequenze."""
     ncols, has_header = _peek_columns(path)
     df = pd.read_csv(path) if has_header else pd.read_csv(path, header=None)
     if df.shape[1] == 2:
@@ -136,10 +114,21 @@ def load_seq_label_dataframe(path):
 
 
 def get_task_dataframes(task_name, base_dir, viraminer_folder):
-    """Ritorna i DataFrame di train e validation per la task selezionata."""
+    """Ritorna i DataFrame di train e validation per la task selezionata con fallback sui path."""
     if task_name == 'viral':
         train_path = os.path.join(viraminer_folder, "fullset_train.csv")
         val_path = os.path.join(viraminer_folder, "fullset_validation.csv")
+
+        # Fallback automatico se il file non esiste nel percorso relativo
+        if not os.path.exists(train_path):
+            alt_train_dna = os.path.join(base_dir, "DNA_data", "fullset_train.csv")
+            alt_val_dna = os.path.join(base_dir, "DNA_data", "fullset_validation.csv")
+            if os.path.exists(alt_train_dna):
+                train_path, val_path = alt_train_dna, alt_val_dna
+            else:
+                train_path = os.path.join(base_dir, "fullset_train.csv")
+                val_path = os.path.join(base_dir, "fullset_validation.csv")
+
         train_df = load_seq_label_dataframe(train_path)
         val_df = load_seq_label_dataframe(val_path)
         return train_df, val_df
@@ -154,8 +143,6 @@ def get_task_dataframes(task_name, base_dir, viraminer_folder):
         raise ValueError(f"Task non valida: {task_name}")
 
     full_df = load_seq_label_dataframe(train_path)
-    # Split 80/20 riproducibile per i dataset con singolo file, stesso seed
-    # e stessa logica usata in train_vir_pipeline.py per coerenza tra architetture.
     full_df = full_df.sample(frac=1, random_state=2020).reset_index(drop=True)
     n_val = int(len(full_df) * 0.2)
     val_df = full_df.iloc[:n_val].reset_index(drop=True)
@@ -340,21 +327,14 @@ model.eval()
 
 
 def _find_single_csv(folder, label):
-    """Trova il CSV di test in una cartella. Preferisce file con 'test' nel nome
-    per evitare di scegliere per errore il file di training quando ce ne sono
-    più di uno."""
+    """Trova il CSV di test in una cartella."""
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if len(all_csvs) == 0:
         print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.")
         return None
     test_csvs = [f for f in all_csvs if 'test' in os.path.basename(f).lower()]
     if test_csvs:
-        if len(test_csvs) > 1:
-            print(f"[WARN] '{label}': più file con 'test' nel nome in {folder}, uso il primo: "
-                  f"{test_csvs[0]} (altri: {test_csvs[1:]}). Verifica manualmente.")
         return test_csvs[0]
-    print(f"[WARN] '{label}': nessun file con 'test' nel nome in {folder}, uso il primo CSV "
-          f"disponibile ({all_csvs[0]}) - VERIFICA che non sia il training set!")
     return all_csvs[0]
 
 
@@ -366,13 +346,29 @@ def _loader_from_csv(path):
 
 DATASETS_TO_EVAL = {}
 
-# val/test_VM nativi ViraMiner
+# val/test_VM nativi ViraMiner con ricerca fallback
 val_native_path = os.path.join(args.viraminer_folder, "fullset_validation.csv")
 test_native_path = os.path.join(args.viraminer_folder, "fullset_test.csv")
+
+if not os.path.exists(val_native_path):
+    for candidate in [os.path.join(args.data_folder, "DNA_data", "fullset_validation.csv"),
+                      os.path.join(args.data_folder, "fullset_validation.csv")]:
+        if os.path.exists(candidate):
+            val_native_path = candidate
+            break
+
+if not os.path.exists(test_native_path):
+    for candidate in [os.path.join(args.data_folder, "DNA_data", "fullset_test.csv"),
+                      os.path.join(args.data_folder, "fullset_test.csv")]:
+        if os.path.exists(candidate):
+            test_native_path = candidate
+            break
+
 if os.path.exists(val_native_path):
     DATASETS_TO_EVAL['val'] = _loader_from_csv(val_native_path)
 else:
     print(f"[SKIP] 'val': path non trovato ({val_native_path}).")
+
 if os.path.exists(test_native_path):
     DATASETS_TO_EVAL['test_VM'] = _loader_from_csv(test_native_path)
 else:
@@ -392,24 +388,13 @@ if os.path.exists(_anell_test):
 else:
     print(f"[SKIP] 'test_anellovirus': path non trovato ({_anell_test}).")
 
-# SIM: 15 test set rumorosi, auto-discovery ricorsiva con chiave basata sul
-# path relativo (fix collisione chiavi, stesso bug già risolto altrove: la
-# versione precedente usava solo il basename, identico per tutti e 15 i file
-# "fullset_test.csv", facendoli collassare in un'unica chiave).
 _sim_base_dir = os.path.join(args.data_folder, "SIM")
 _sim_files = sorted(glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True))
-if not _sim_files:
-    print(f"[WARN] Nessun CSV trovato in {_sim_base_dir} (test rumore SIM).")
 
 _seen_sim_keys = {}
 for _f in _sim_files:
     _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
     _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
-    if _key in _seen_sim_keys:
-        print(f"[WARN] Chiave duplicata '{_key}' per i file SIM:\n"
-              f"       {_seen_sim_keys[_key]}\n"
-              f"       {_f}\n"
-              f"       Il primo file verrà sovrascritto: verifica la struttura di {_sim_base_dir}.")
     _seen_sim_keys[_key] = _f
     DATASETS_TO_EVAL[_key] = _loader_from_csv(_f)
 
@@ -425,9 +410,6 @@ with torch.no_grad():
             else:
                 logits_list.extend(out.cpu().numpy().flatten())
 
-        # Stesso schema di naming usato in ViraExplorer: nessun suffisso per
-        # il task virale (compatibilità con i file già esistenti), suffisso
-        # esplicito per gli altri task.
         task_prefix = f"_{args.task}" if args.task != 'viral' else ""
         filename = f"nucleictransformer_cfg{args.config}{task_prefix}_{name}.txt"
         np.savetxt(os.path.join(GLOBAL_LOGITS_DIR, filename), np.array(logits_list), fmt='%.6f')
