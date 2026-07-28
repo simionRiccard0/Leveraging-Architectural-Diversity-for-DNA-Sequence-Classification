@@ -25,9 +25,9 @@ SAVE_DIR        = "/home/simionricc/virproject/"
 BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_viraexplorer_v2.pth")
 CHECKPOINT_PATH = os.path.join(SAVE_DIR, "checkpoint.pth")
 
-train = pd.read_csv('ViraMiner/data/DNA_data/fullset_train.csv', header=None)
-val   = pd.read_csv('ViraMiner/data/DNA_data/fullset_validation.csv', header=None)
-test  = pd.read_csv('ViraMiner/data/DNA_data/fullset_test.csv', header=None)
+train = pd.read_csv('datasets/DNA_data/fullset_train.csv', header=None)
+val   = pd.read_csv('datasets/DNA_data/fullset_validation.csv', header=None)
+test  = pd.read_csv('datasets/DNA_data/fullset_test.csv', header=None)
 
 print("Train shape:", train.shape)
 print("Sequence length:", len(train[1][0]))

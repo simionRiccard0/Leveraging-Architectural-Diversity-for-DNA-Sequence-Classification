@@ -12,3 +12,16 @@ datasets/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Ignora pesi HDF5 e cartelle dati pesanti
+*.hdf5
+*.h5
+virproject/ViraMiner/data/
+virproject/data_profs/
+virproject/ViraMiner/final_ViraMiner/
+
+# Escludi tutti i dataset CSV e file pesanti
+*.csv
+*.tsv
+virproject/ViraMiner/data/
+virproject/data_profs/
