@@ -7,7 +7,7 @@ datasets/
 *.bin
 *.onnx
 *.rar
-*.zip
+# # *.zip
 *.tar.gz
 __pycache__/
 *.pyc
