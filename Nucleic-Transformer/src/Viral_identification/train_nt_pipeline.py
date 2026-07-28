@@ -19,6 +19,12 @@ from Network import *
 from LrScheduler import *
 
 # ========================================== #
+# 0. COSTANTI METODOLOGICHE GLOBALI          #
+# ========================================== #
+# Lunghezza fissa standardizzata a 300 bp per tutte le architetture e task
+MAX_LEN = 300
+
+# ========================================== #
 # 1. PARSING DEGLI ARGOMENTI                 #
 # ========================================== #
 parser = argparse.ArgumentParser(
@@ -32,8 +38,7 @@ parser.add_argument('--task', type=str, default='viral',
 parser.add_argument('--data_folder', '-d', default='/home/simionricc/datasets',
                      help="Path alla cartella condivisa con ecoli/enhancer/SIM/unseen_anell")
 parser.add_argument('--viraminer_folder', default='..',
-                     help="Path (relativo alla working directory dello script, tipicamente "
-                          "Viral_identification/) ai file nativi fullset_train/validation/test.csv")
+                     help="Path ai file nativi fullset_train/validation/test.csv")
 parser.add_argument('--gpu_id', type=str, default='0')
 parser.add_argument('--ntoken', type=int, default=4)
 parser.add_argument('--ninp', type=int, default=512)
@@ -51,19 +56,20 @@ args = opts
 # ========================================== #
 # 2. MAPPATURA IPERPARAMETRI DELLA TABELLA   #
 # ========================================== #
+# batch_size=16 per azzerare il rischio OOM sulla Self-Attention
 CONFIG_MAP = {
     'A': {  # Configurazione stile ViraExplorer
-        'epochs': 120, 'early_stop': True, 'patience': 15, 'batch_size': 128,
+        'epochs': 120, 'early_stop': True, 'patience': 15, 'batch_size': 16,
         'loss': 'focal', 'optimizer': 'adamw', 'lr_sched': 'cosine', 'augment': 'rc_shift',
         'dropout': 0.1, 'nclass': 1
     },
     'B': {  # Configurazione stile FullE
-        'epochs': 30, 'early_stop': False, 'patience': 0, 'batch_size': 128,
+        'epochs': 30, 'early_stop': False, 'patience': 0, 'batch_size': 16,
         'loss': 'bce', 'optimizer': 'adam', 'lr_sched': 'step', 'augment': 'none',
         'dropout': 0.2, 'nclass': 1
     },
     'C': {  # Configurazione nativa Nucleic Transformer
-        'epochs': 60, 'early_stop': False, 'patience': 0, 'batch_size': 128,
+        'epochs': 60, 'early_stop': False, 'patience': 0, 'batch_size': 16,
         'loss': 'ce', 'optimizer': 'adam', 'lr_sched': 'aiayn', 'augment': 'mutation',
         'dropout': 0.1, 'nclass': 2
     }
@@ -82,7 +88,6 @@ best_model_path = os.path.join(checkpoints_folder, 'best_model.pt')
 # 3. HELPER CARICAMENTO DATASET & SPLIT      #
 # ========================================== #
 def _peek_columns(path):
-    """Legge solo la prima riga per capire se c'è un header e quante colonne ci sono."""
     with open(path, 'r') as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(',')
@@ -99,7 +104,6 @@ def _peek_columns(path):
 
 
 def load_seq_label_dataframe(path):
-    """Autodetect del formato CSV con normalizzazione uppercase delle sequenze."""
     ncols, has_header = _peek_columns(path)
     df = pd.read_csv(path) if has_header else pd.read_csv(path, header=None)
     if df.shape[1] == 2:
@@ -114,7 +118,6 @@ def load_seq_label_dataframe(path):
 
 
 def get_task_dataframes(task_name, base_dir, viraminer_folder):
-    """Ritorna i DataFrame di train e validation per la task selezionata con fallback sui path."""
     if task_name == 'viral':
         train_path = os.path.join(viraminer_folder, "fullset_train.csv")
         val_path = os.path.join(viraminer_folder, "fullset_validation.csv")
@@ -151,8 +154,22 @@ def get_task_dataframes(task_name, base_dir, viraminer_folder):
 
 
 # ========================================== #
-# 4. DATA AUGMENTATION & DATASET ADATTIVO    #
+# 4. DATA AUGMENTATION & CLEANING RIGOROSO   #
 # ========================================== #
+def clean_and_pad_sequence(seq, target_len=300):
+    """Sostituisce qualsiasi nucleotide non-ACGT (es. 'N') con 'A' e forza la lunghezza a 300 bp."""
+    seq = seq.upper()
+    valid_nucs = {'A', 'C', 'G', 'T'}
+    cleaned = [b if b in valid_nucs else 'A' for b in seq]
+    
+    if len(cleaned) < target_len:
+        cleaned.extend(['A'] * (target_len - len(cleaned)))
+    else:
+        cleaned = cleaned[:target_len]
+        
+    return "".join(cleaned)
+
+
 def mutate_string_sequence(seq, n_mutations=40):
     seq_list = list(seq)
     seq_len = len(seq_list)
@@ -167,7 +184,7 @@ def mutate_string_sequence(seq, n_mutations=40):
 
 class ParametricViraminerDataset(Dataset):
     def __init__(self, dataframe, augment_type='none'):
-        self.sequences = dataframe.iloc[:, 1].values
+        self.sequences = [str(s).upper() for s in dataframe.iloc[:, 1].values]
         self.labels = dataframe.iloc[:, 2].values
         self.augment_type = augment_type
 
@@ -178,15 +195,23 @@ class ParametricViraminerDataset(Dataset):
         seq = self.sequences[idx]
         label = self.labels[idx]
 
+        # 1. Data Augmentation
         if self.augment_type == 'rc_shift':
-            complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N'}
+            complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
             if random.random() > 0.5:
-                seq = ''.join(complement.get(b, 'N') for b in reversed(seq))
+                seq = ''.join(complement.get(b, 'A') for b in reversed(seq))
+            
             shift = random.randint(-5, 5)
-            seq = seq[max(0, shift):] if shift > 0 else 'N' * (-shift) + seq
-            seq = seq[:300]
+            if shift > 0:
+                seq = seq[shift:] + 'A' * shift
+            elif shift < 0:
+                seq = 'A' * (-shift) + seq[:shift]
+
         elif self.augment_type == 'mutation':
             seq = mutate_string_sequence(seq, n_mutations=40)
+
+        # 2. CLEANING E PADDING RIGOROSO A 300 BP (SENZA 'N')
+        seq = clean_and_pad_sequence(seq, target_len=MAX_LEN)
 
         temp_ds = ViraminerDataset([seq], [label])
         return temp_ds[0]
@@ -194,13 +219,14 @@ class ParametricViraminerDataset(Dataset):
 
 # Caricamento dati per la task selezionata
 train_df, val_df = get_task_dataframes(args.task, args.data_folder, args.viraminer_folder)
-print(f"[i] Task: '{args.task}' | Config: '{args.config}' | "
-      f"Train samples: {len(train_df)} | Val samples: {len(val_df)}")
+
+print(f"[i] Task: '{args.task}' | Config: '{args.config}' | Input Length: {MAX_LEN} bp (STRICT ACGT) | "
+      f"Train: {len(train_df)} | Val: {len(val_df)}")
 
 train_loader = DataLoader(ParametricViraminerDataset(train_df, augment_type=cfg['augment']),
-                           batch_size=cfg['batch_size'], shuffle=True, num_workers=2)
+                           batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
 val_loader = DataLoader(ParametricViraminerDataset(val_df, augment_type='none'),
-                         batch_size=cfg['batch_size'] * 2, shuffle=False)
+                         batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
 
 
 # ========================================== #
@@ -232,7 +258,6 @@ elif cfg['loss'] == 'bce':
 else:
     criterion = nn.CrossEntropyLoss(reduction='none')
 
-# Setup Ottimizzatore ed LR Scheduler
 if cfg['optimizer'] == 'adamw':
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 else:
@@ -242,7 +267,7 @@ else:
 if cfg['lr_sched'] == 'cosine':
     def lr_lambda(epoch):
         if epoch < 5:
-            return epoch / 5
+            return (epoch + 1) / 5
         return 0.5 * (1 + math.cos(math.pi * (epoch - 5) / (cfg['epochs'] - 5)))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 elif cfg['lr_sched'] == 'step':
@@ -251,7 +276,7 @@ else:
     scheduler = lr_AIAYN(optimizer, opts.ninp, opts.warmup_steps, opts.lr_scale)
 
 # ========================================== #
-# 6. LOOP DI TRAINING CON SCALER (AMP NATIVO)#
+# 6. LOOP DI TRAINING CON SCALER             #
 # ========================================== #
 scaler = GradScaler()
 best_auc = 0
@@ -318,6 +343,9 @@ for epoch in range(cfg['epochs']):
 if not cfg['early_stop']:
     torch.save(model.state_dict(), best_model_path)
 
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 # ========================================== #
 # 7. VALUTAZIONE IN CASCATA SUI DATASET      #
 # ========================================== #
@@ -327,7 +355,6 @@ model.eval()
 
 
 def _find_single_csv(folder, label):
-    """Trova il CSV di test in una cartella."""
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if len(all_csvs) == 0:
         print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.")
@@ -341,7 +368,7 @@ def _find_single_csv(folder, label):
 def _loader_from_csv(path):
     df_extra = load_seq_label_dataframe(path)
     return DataLoader(ParametricViraminerDataset(df_extra, augment_type='none'),
-                       batch_size=cfg['batch_size'] * 2, shuffle=False)
+                       batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
 
 
 DATASETS_TO_EVAL = {}
@@ -421,4 +448,4 @@ with torch.no_grad():
 import shutil
 if os.path.exists(checkpoints_folder):
     shutil.rmtree(checkpoints_folder)
-print("Cartella pesi pesanti rimossa per preservare lo spazio sul cluster.")
+print("Cartella pesi temporanei rimossa con successo.")
