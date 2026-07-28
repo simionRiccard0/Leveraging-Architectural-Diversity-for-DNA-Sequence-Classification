@@ -45,6 +45,8 @@ To evaluate both **native optimization** and **cross-paradigm adaptability**, ea
 │    Native    │                   │    Native    │                   │    Native    │
 └──────────────┘                   └──────────────┘                   └──────────────┘
 
+```
+
 #### Configuration Specifications
 
 ##### 1. Configuration A ($C_1$ – ViraExplorer Strategy)
