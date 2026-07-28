@@ -1,4 +1,5 @@
-# Cross-Genomic Deep Learning Benchmark Framework
+# Leveraging Architectural Diversity for DNA Sequence Classification
+
 
 This repository implements a multi-domain benchmark to evaluate how diverse deep learning paradigms generalize across heterogeneous genomic sequence classification tasks directly from raw nucleotide sequences without manual feature extraction.
 
