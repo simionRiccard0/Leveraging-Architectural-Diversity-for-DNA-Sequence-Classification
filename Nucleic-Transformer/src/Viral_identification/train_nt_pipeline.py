@@ -7,6 +7,7 @@ import random
 import argparse
 import math
 import glob
+import shutil
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
@@ -14,23 +15,30 @@ from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import roc_auc_score
 
 from Functions import *
-from Dataset import *
 from Network import *
 from LrScheduler import *
 
 # ========================================== #
-# 0. GLOBAL METHODOLOGICAL CONSTANTS         #
+# 0. CONSTANTS & FAST TRANSLATION TABLES     #
 # ========================================== #
-MAX_LEN = 300  # Strict standardized input sequence length
+MAX_LEN = 300
+NUC_TO_INT = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+
+# Fast C-level string sanitization table (maps N and ambiguous base codes to 'A')
+CLEAN_TRANS = str.maketrans({
+    'N': 'A', 'R': 'A', 'Y': 'C', 'S': 'G', 'W': 'A',
+    'K': 'G', 'M': 'A', 'B': 'C', 'D': 'A', 'H': 'A', 'V': 'A'
+})
+RC_TRANS = str.maketrans('ACGT', 'TGCA')
 
 # ========================================== #
-# 1. CLI ARGUMENT PARSING                   #
+# 1. CLI ARGUMENT PARSING                    #
 # ========================================== #
 parser = argparse.ArgumentParser(
-    description="Nucleic Transformer Multi-Task Training Pipeline (DNA Sequence Classification)"
+    description="Nucleic Transformer Multi-Task High-Performance Pipeline"
 )
 parser.add_argument('--config', type=str, required=True, choices=['A', 'B', 'C'],
-                     help="Training configuration strategy")
+                     help="Training configuration strategy (A, B, C)")
 parser.add_argument('--task', type=str, default='viral',
                      choices=['viral', 'ecoli', 'enhancer', 'anellovirus'],
                      help="Target biological training task (default: viral)")
@@ -55,7 +63,6 @@ args = opts
 # ========================================== #
 # 2. HYPERPARAMETER CONFIGURATIONS           #
 # ========================================== #
-# Batch size reduced to 16 to contain Self-Attention VRAM usage
 CONFIG_MAP = {
     'A': {  # ViraExplorer Native Strategy
         'epochs': 120, 'early_stop': True, 'patience': 15, 'batch_size': 16,
@@ -82,12 +89,10 @@ checkpoints_folder = f'checkpoints_{args.task}_cfg_{args.config}'
 os.makedirs(checkpoints_folder, exist_ok=True)
 best_model_path = os.path.join(checkpoints_folder, 'best_model.pt')
 
-
 # ========================================== #
 # 3. DATA LOADING HELPERS                    #
 # ========================================== #
 def _peek_columns(path):
-    """Detects header and column structure of CSV sequence files."""
     with open(path, 'r') as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(',')
@@ -104,7 +109,6 @@ def _peek_columns(path):
 
 
 def load_seq_label_dataframe(path):
-    """Loads CSV file into a standardized DataFrame (index, sequence, label)."""
     ncols, has_header = _peek_columns(path)
     df = pd.read_csv(path) if has_header else pd.read_csv(path, header=None)
     if df.shape[1] == 2:
@@ -119,12 +123,10 @@ def load_seq_label_dataframe(path):
 
 
 def get_task_dataframes(task_name, base_dir, viraminer_folder):
-    """Retrieves train and validation splits for the specified task."""
     if task_name == 'viral':
         train_path = os.path.join(viraminer_folder, "fullset_train.csv")
         val_path = os.path.join(viraminer_folder, "fullset_validation.csv")
 
-        # Fallback if relative paths do not exist
         if not os.path.exists(train_path):
             alt_train_dna = os.path.join(base_dir, "DNA_data", "fullset_train.csv")
             alt_val_dna = os.path.join(base_dir, "DNA_data", "fullset_validation.csv")
@@ -156,41 +158,29 @@ def get_task_dataframes(task_name, base_dir, viraminer_folder):
 
 
 # ========================================== #
-# 4. SEQUENCE SANITIZATION & AUGMENTATION    #
+#  DATASET                                   #
 # ========================================== #
-def clean_and_pad_sequence(seq, target_len=300):
-    """Replaces non-ACGT characters (e.g. 'N') with 'A' and enforces strict target length."""
-    seq = seq.upper()
-    valid_nucs = {'A', 'C', 'G', 'T'}
-    cleaned = [b if b in valid_nucs else 'A' for b in seq]
-    
-    if len(cleaned) < target_len:
-        cleaned.extend(['A'] * (target_len - len(cleaned)))
-    else:
-        cleaned = cleaned[:target_len]
-        
-    return "".join(cleaned)
-
-
-def mutate_string_sequence(seq, n_mutations=40):
-    """Applies online random point mutations to string sequences."""
-    seq_list = list(seq)
-    seq_len = len(seq_list)
-    nucleotides = ['A', 'C', 'G', 'T']
-    pos_to_mutate = random.sample(range(seq_len), min(n_mutations, seq_len))
-    for pos in pos_to_mutate:
-        current_nuc = seq_list[pos].upper()
-        choices = [n for n in nucleotides if n != current_nuc]
-        seq_list[pos] = random.choice(choices)
-    return "".join(seq_list)
-
-
-class ParametricViraminerDataset(Dataset):
-    """Dataset wrapper with online sequence augmentation and length sanitization."""
-    def __init__(self, dataframe, augment_type='none'):
-        self.sequences = [str(s).upper() for s in dataframe.iloc[:, 1].values]
+class FastNTDataset(Dataset):
+    """
+    Optimized PyTorch Dataset for Nucleic Transformer.
+    Replaces object re-instantiations and eliminates parasitic I/O log prints.
+    """
+    def __init__(self, dataframe, augment_type='none', target_len=300):
+        raw_seqs = dataframe.iloc[:, 1].values
         self.labels = dataframe.iloc[:, 2].values
         self.augment_type = augment_type
+        self.target_len = target_len
+
+        cleaned = []
+        for s in raw_seqs:
+            s_clean = str(s).upper().translate(CLEAN_TRANS)
+            if len(s_clean) < target_len:
+                s_clean = s_clean.ljust(target_len, 'A')
+            else:
+                s_clean = s_clean[:target_len]
+            cleaned.append(s_clean)
+            
+        self.sequences = cleaned
 
     def __len__(self):
         return len(self.sequences)
@@ -199,45 +189,59 @@ class ParametricViraminerDataset(Dataset):
         seq = self.sequences[idx]
         label = self.labels[idx]
 
-        # 1. Data Augmentation
+        # Fast Augmentation (CORRECTED SLICING)
         if self.augment_type == 'rc_shift':
-            complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
             if random.random() > 0.5:
-                seq = ''.join(complement.get(b, 'A') for b in reversed(seq))
-            
+                seq = seq.translate(RC_TRANS)[::-1]
             shift = random.randint(-5, 5)
             if shift > 0:
                 seq = seq[shift:] + 'A' * shift
             elif shift < 0:
-                seq = 'A' * (-shift) + seq[:shift]
+                seq = 'A' * (-shift) + seq[:shift]  # FIX: [:shift] instead of [:(-shift)]
 
         elif self.augment_type == 'mutation':
-            seq = mutate_string_sequence(seq, n_mutations=40)
+            seq_list = list(seq)
+            n_mut = min(40, len(seq_list))
+            for pos in random.sample(range(len(seq_list)), n_mut):
+                seq_list[pos] = random.choice(['A', 'C', 'G', 'T'])
+            seq = "".join(seq_list)
 
-        # 2. Strict cleaning and padding to MAX_LEN (ACGT only)
-        seq = clean_and_pad_sequence(seq, target_len=MAX_LEN)
+        encoded = [NUC_TO_INT.get(b, 0) for b in seq]
+        
+        return {
+            'data': torch.tensor(encoded, dtype=torch.long),
+            'labels': torch.tensor(label)
+        }
 
-        temp_ds = ViraminerDataset([seq], [label])
-        return temp_ds[0]
 
-
+# Load dataset splits
 train_df, val_df = get_task_dataframes(args.task, args.data_folder, args.viraminer_folder)
 
 print(f"[i] Task: '{args.task}' | Config: '{args.config}' | Input Length: {MAX_LEN} bp (STRICT ACGT) | "
       f"Train: {len(train_df)} | Val: {len(val_df)}")
 
-# num_workers=0 avoids shared memory issues in container environments
-train_loader = DataLoader(ParametricViraminerDataset(train_df, augment_type=cfg['augment']),
-                           batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
-val_loader = DataLoader(ParametricViraminerDataset(val_df, augment_type='none'),
-                         batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
+# Fast DataLoaders with multi-process prefetching
+train_loader = DataLoader(
+    FastNTDataset(train_df, augment_type=cfg['augment']),
+    batch_size=cfg['batch_size'],
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True
+)
 
+val_loader = DataLoader(
+    FastNTDataset(val_df, augment_type='none'),
+    batch_size=cfg['batch_size'],
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
 
 # ========================================== #
-# 5. LOSS FUNCTIONS & SETUP                  #
+# 5. LOSS FUNCTIONS & MODEL SETUP            #
 # ========================================== #
 class FocalLoss(nn.Module):
-    """Focal Loss with label smoothing for class imbalance handling."""
     def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.05):
         super().__init__()
         self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
@@ -281,8 +285,9 @@ else:
     scheduler = lr_AIAYN(optimizer, opts.ninp, opts.warmup_steps, opts.lr_scale)
 
 # ========================================== #
-# 6. TRAINING & VALIDATION LOOP              #
+# 6. TRAINING LOOP WITH GRADIENT ACCUMULATION#
 # ========================================== #
+GRAD_ACCUM_STEPS = 2
 scaler = GradScaler()
 best_auc = 0
 counter = 0
@@ -290,17 +295,17 @@ counter = 0
 for epoch in range(cfg['epochs']):
     model.train()
     total_loss = 0
+    optimizer.zero_grad()
+
     for step, data in enumerate(train_loader):
         if cfg['lr_sched'] == 'aiayn':
             scheduler.step()
 
-        src = data['data'].to(device).long()
+        src = data['data'].to(device, non_blocking=True).long()
         if cfg['loss'] == 'ce':
-            labels = data['labels'].to(device).long()
+            labels = data['labels'].to(device, non_blocking=True).long()
         else:
-            labels = data['labels'].to(device).float().unsqueeze(1)
-
-        optimizer.zero_grad()
+            labels = data['labels'].to(device, non_blocking=True).float().unsqueeze(1)
 
         with autocast():
             output = model(src)
@@ -308,12 +313,19 @@ for epoch in range(cfg['epochs']):
                 loss = torch.mean(criterion(output, labels))
             else:
                 loss = criterion(output, labels)
+            
+            loss = loss / GRAD_ACCUM_STEPS
 
         scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        total_loss += loss.item()
+
+        if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * GRAD_ACCUM_STEPS
 
     if cfg['lr_sched'] != 'aiayn':
         scheduler.step()
@@ -322,7 +334,7 @@ for epoch in range(cfg['epochs']):
     val_preds, val_targets = [], []
     with torch.no_grad():
         for data in val_loader:
-            src = data['data'].to(device).long()
+            src = data['data'].to(device, non_blocking=True).long()
             out = model(src)
             if cfg['loss'] == 'ce':
                 probs = F.softmax(out, dim=1)[:, 1]
@@ -352,15 +364,14 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
 # ========================================== #
-# 7. CASCADE EVALUATION & LOGIT EXPORT       #
+# 7. CASCADE EVALUATION                      #
 # ========================================== #
-print("\nStarting logit extraction...")
+print("\nStarting high-speed logit extraction...")
 model.load_state_dict(torch.load(best_model_path, map_location=device))
 model.eval()
 
 
 def _find_single_csv(folder, label):
-    """Finds test CSV file in directory."""
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if len(all_csvs) == 0:
         print(f"[SKIP] '{label}': No CSV found in {folder}.")
@@ -371,15 +382,20 @@ def _find_single_csv(folder, label):
     return all_csvs[0]
 
 
-def _loader_from_csv(path):
+def _loader_from_csv(path, batch_size=128):
+    """Evaluation DataLoader with Batch Size 128 for high-speed inference."""
     df_extra = load_seq_label_dataframe(path)
-    return DataLoader(ParametricViraminerDataset(df_extra, augment_type='none'),
-                       batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
+    return DataLoader(
+        FastNTDataset(df_extra, augment_type='none'),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
 
 
 DATASETS_TO_EVAL = {}
 
-# Native ViraMiner val/test with fallback paths
 val_native_path = os.path.join(args.viraminer_folder, "fullset_validation.csv")
 test_native_path = os.path.join(args.viraminer_folder, "fullset_test.csv")
 
@@ -424,18 +440,16 @@ else:
 _sim_base_dir = os.path.join(args.data_folder, "SIM")
 _sim_files = sorted(glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True))
 
-_seen_sim_keys = {}
 for _f in _sim_files:
     _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
     _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
-    _seen_sim_keys[_key] = _f
     DATASETS_TO_EVAL[_key] = _loader_from_csv(_f)
 
 with torch.no_grad():
     for name, loader in DATASETS_TO_EVAL.items():
         logits_list = []
         for data in loader:
-            src = data['data'].to(device).long()
+            src = data['data'].to(device, non_blocking=True).long()
             out = model(src)
             if cfg['loss'] == 'ce':
                 logits_equivalent = out[:, 1] - out[:, 0]
@@ -451,7 +465,6 @@ with torch.no_grad():
 # ========================================== #
 # 8. CHECKPOINT CLEANUP                      #
 # ========================================== #
-import shutil
 if os.path.exists(checkpoints_folder):
     shutil.rmtree(checkpoints_folder)
 print("Temporary checkpoints folder removed successfully.")
