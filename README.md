@@ -198,7 +198,7 @@ The analysis scripts operate directly on the stored logits, making experimentati
 
 ---
 
-## 📐 End-to-End Workflow
+## End-to-End Workflow
 
 ```text
                 Select Architecture
