@@ -20,7 +20,6 @@ from sklearn.metrics import (
     precision_recall_curve,
 )
 
-# Append project root directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.dataset.csv_dataset import CSVDataset
@@ -28,6 +27,19 @@ from src.model.network import Branch, Merger
 from src.utils.create_model import create_model
 from src.utils.metrics import auroc as score_fn
 from src.utils.train_model import train_model
+
+RC_TRANS = str.maketrans("ACGT", "TGCA")
+
+
+def build_seq_set(seq_iterable):
+    """Generates a fast lookup set containing both forward and reverse-complement sequences."""
+    s = set()
+    for seq in seq_iterable:
+        seq_str = str(seq).upper()
+        s.add(seq_str)
+        s.add(seq_str.translate(RC_TRANS)[::-1])
+    return s
+
 
 BRANCHES = [
     "branch/frequency",
@@ -56,49 +68,47 @@ BRANCH_KEY_MAP = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="FullE Complete Ensemble Pipeline (10 Models x Config)"
+        description="FullE Complete Ensemble Pipeline (10 Models x Config) - DEI Cluster"
     )
     parser.add_argument(
         "--config",
         type=str,
         required=True,
         choices=["A", "B", "C"],
-        help="Training configuration strategy (A, B, C)",
+        help="Configurazione di training (A, B, C)",
     )
     parser.add_argument(
         "--viraminer_folder",
         default="dataset",
-        help="Path to native fullset_train/validation/test.csv files",
+        help="Path (relativo al repo, es. 'dataset') ai file nativi "
+        "fullset_train/validation/test.csv",
     )
     parser.add_argument(
         "--data_folder",
         "-d",
         default="/home/simionricc/datasets",
-        help="Root directory for external benchmark datasets",
+        help="Path alla cartella condivisa con ecoli/enhancer/SIM/unseen_anell",
     )
     parser.add_argument(
         "--template_dir",
         "-t",
         default="ready_to_train_files/final/onehot",
-        help="Path to JSON model configuration templates",
+        help="Path ai JSON template originali",
     )
     parser.add_argument(
         "--output_dir",
         "-o",
         default="results_fulle_ensemble",
-        help="Output directory for model checkpoints",
+        help="Directory di output per i checkpoint .ptm",
     )
     parser.add_argument(
         "--logits_dir",
         default=None,
-        help="Target directory for output logit text files",
+        help="Directory temporanea per i logit estratti (evita race conditions tra job)",
     )
     return parser.parse_args()
 
 
-# ========================================== #
-# SEED FOR REPRODUCIBILITY                   #
-# ========================================== #
 def seed_everything(seed=2020):
     random.seed(seed)
     np.random.seed(seed)
@@ -109,11 +119,7 @@ def seed_everything(seed=2020):
         torch.backends.cudnn.benchmark = False
 
 
-# ========================================== #
-# TENSOR-LEVEL DATA AUGMENTATION             #
-# ========================================== #
 def apply_tensor_augmentation(X, augment_type):
-    """Applies augmentation directly on One-Hot encoded PyTorch tensors."""
     if augment_type == "none":
         return X
 
@@ -172,7 +178,6 @@ def apply_tensor_augmentation(X, augment_type):
 
 
 class AugmentedDataLoader:
-    """DataLoader wrapper for online tensor-level data augmentation."""
     def __init__(self, dataloader, augment_type):
         self.dataloader = dataloader
         self.augment_type = augment_type
@@ -196,11 +201,7 @@ class AugmentedDataLoader:
                 yield batch
 
 
-# ========================================== #
-# LOSS FUNCTIONS                             #
-# ========================================== #
 class ProbabilityFocalLoss(nn.Module):
-    """Focal Loss operating on predicted probabilities."""
     def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.05):
         super().__init__()
         self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
@@ -223,7 +224,6 @@ class ProbabilityFocalLoss(nn.Module):
 
 
 class SafeBCELoss(nn.Module):
-    """Safe Binary Cross-Entropy loss wrapper."""
     def __init__(self):
         super().__init__()
         self.bce = nn.BCELoss()
@@ -232,11 +232,7 @@ class SafeBCELoss(nn.Module):
         return self.bce(probs, targets.view_as(probs).float())
 
 
-# ========================================== #
-# DATASET LOADING HELPERS                    #
-# ========================================== #
 def _peek_columns(path):
-    """Detects header and column structure of CSV files."""
     with open(path, "r") as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(",")
@@ -253,7 +249,6 @@ def _peek_columns(path):
 
 
 def _normalize_to_temp_csv(path):
-    """Normalizes dataset layout to standard temporary CSV format."""
     ncols, has_header = _peek_columns(path)
     df = pd.read_csv(path) if has_header else pd.read_csv(path, header=None)
     if df.shape[1] == 2:
@@ -274,7 +269,6 @@ def _normalize_to_temp_csv(path):
 
 
 def make_eval_loader(csv_path, normalize=False):
-    """Creates evaluation DataLoader with One-Hot encoding."""
     if normalize:
         csv_path = _normalize_to_temp_csv(csv_path)
     ds = CSVDataset(csv_path, transform="onehot_encoding")
@@ -282,10 +276,9 @@ def make_eval_loader(csv_path, normalize=False):
 
 
 def _find_single_csv(folder, label):
-    """Finds test CSV file in directory."""
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if len(all_csvs) == 0:
-        print(f"[SKIP] '{label}': No CSV found in {folder}.")
+        print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.", flush=True)
         return None
     test_csvs = [f for f in all_csvs if "test" in os.path.basename(f).lower()]
     if test_csvs:
@@ -294,23 +287,18 @@ def _find_single_csv(folder, label):
 
 
 def _find_json_config(folder_path):
-    """Finds JSON configuration file for model definitions."""
     json_files = sorted(list(Path(folder_path).glob("*.json")))
     if not json_files:
         raise FileNotFoundError(
-            f"No .json configuration file found in: {folder_path}"
+            f"Nessun file .json trovato nella directory: {folder_path}"
         )
     return json_files[0]
 
 
 def _sanitize_submodel_name(rel_path):
-    """Sanitizes model relative paths for output filenames."""
     return rel_path.replace("/", "_")
 
 
-# ========================================== #
-# MAIN PIPELINE                              #
-# ========================================== #
 def main():
     args = parse_args()
     seed_everything(2020)
@@ -370,7 +358,6 @@ def main():
     trained_model_paths = {}
 
     def train_one_network(model_infos, save_path, is_merger=False):
-        """Helper to train a single branch or merger network."""
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         if "parameters" in model_infos:
@@ -378,14 +365,14 @@ def main():
 
         model = create_model(model_infos)
 
-        # Freeze branch parameters during merger training
         if is_merger and isinstance(model, Merger):
             model.set_branches_trainability(False)
             trainable_names = [
                 name for name, p in model.named_parameters() if p.requires_grad
             ]
             print(
-                f"    [CHECK Merger Freezing] Trainable parameters: {trainable_names}"
+                f"    [CHECK Merger Freezing] Parametri addestrabili: {trainable_names}",
+                flush=True,
             )
 
         loss_fn = (
@@ -455,10 +442,11 @@ def main():
         model.save_model(save_path)
         return save_path
 
-    # -------------------------------------------------------------------------
-    # STEP 1: Train or retrieve 5 Branch networks
-    # -------------------------------------------------------------------------
-    print(f"\n[>>>] STEP 1: Training / Loading 5 Branch Submodels for Config {args.config}")
+    # STEP 1: Addestramento / Recupero dei 5 Branch
+    print(
+        f"\n[>>>] STEP 1: Addestramento / Recupero dei 5 Branch per Config {args.config}",
+        flush=True,
+    )
     for branch_rel in BRANCHES:
         folder_path = Path(args.template_dir) / branch_rel
         json_path = _find_json_config(folder_path)
@@ -468,17 +456,21 @@ def main():
 
         save_ptm = cfg_ckpt_dir / branch_rel / "model.ptm"
         if save_ptm.exists():
-            print(f"  [=] Branch '{branch_rel}' already trained. Skipping training.")
+            print(
+                f"  [=] Branch '{branch_rel}' già addestrato. Salto training.",
+                flush=True,
+            )
         else:
-            print(f"  [+] Training Branch: {branch_rel}...")
+            print(f"  [+] Training Branch: {branch_rel}...", flush=True)
             train_one_network(model_infos, str(save_ptm), is_merger=False)
 
         trained_model_paths[branch_rel] = str(save_ptm)
 
-    # -------------------------------------------------------------------------
-    # STEP 2: Train or retrieve 5 Merger networks
-    # -------------------------------------------------------------------------
-    print(f"\n[>>>] STEP 2: Training / Loading 5 Merger Networks for Config {args.config}")
+    # STEP 2: Addestramento / Recupero dei 5 Merger
+    print(
+        f"\n[>>>] STEP 2: Addestramento / Recupero dei 5 Merger per Config {args.config}",
+        flush=True,
+    )
     for merger_rel in MERGERS:
         folder_path = Path(args.template_dir) / merger_rel
         json_path = _find_json_config(folder_path)
@@ -495,34 +487,81 @@ def main():
 
         save_ptm = cfg_ckpt_dir / merger_rel / "model.ptm"
         if save_ptm.exists():
-            print(f"  [=] Merger '{merger_rel}' already trained. Skipping training.")
+            print(
+                f"  [=] Merger '{merger_rel}' già addestrato. Salto training.",
+                flush=True,
+            )
         else:
-            print(f"  [+] Training Merger: {merger_rel}...")
+            print(f"  [+] Training Merger: {merger_rel}...", flush=True)
             train_one_network(model_infos, str(save_ptm), is_merger=True)
 
         trained_model_paths[merger_rel] = str(save_ptm)
 
-    # -------------------------------------------------------------------------
-    # STEP 3: Logit Extraction & Sum-Rule Ensemble
-    # -------------------------------------------------------------------------
-    print(f"\n[>>>] STEP 3: Logit Extraction and Ensemble for Config {args.config}")
+    # STEP 3: Estrazione Logit (per singolo modello + sum-rule ensemble)
+    print(
+        f"\n[>>>] STEP 3: Estrazione Logit ed Ensemble per Config {args.config}",
+        flush=True,
+    )
 
     datasets_eval = {"val": dl_valid, "test_VM": dl_test}
 
-    _ecoli_csv = _find_single_csv(os.path.join(args.data_folder, "ecoli"), "test_ecoli")
+    _ecoli_csv = _find_single_csv(
+        os.path.join(args.data_folder, "ecoli"), "test_ecoli"
+    )
     if _ecoli_csv:
         datasets_eval["test_ecoli"] = make_eval_loader(_ecoli_csv, normalize=True)
 
-    _enhancer_csv = _find_single_csv(os.path.join(args.data_folder, "enhancer"), "test_enhancer")
+    _enhancer_csv = _find_single_csv(
+        os.path.join(args.data_folder, "enhancer"), "test_enhancer"
+    )
     if _enhancer_csv:
         datasets_eval["test_enhancer"] = make_eval_loader(_enhancer_csv, normalize=True)
 
-    _anell_test = os.path.join(args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv")
-    if os.path.exists(_anell_test):
-        datasets_eval["test_anellovirus"] = make_eval_loader(_anell_test, normalize=True)
+    # Deduplicate Anellovirus test set against fullset_train to eliminate data leakage
+    _anell_test = os.path.join(
+        args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv"
+    )
+    if os.path.exists(_anell_test) and os.path.exists(train_file):
+        train_raw_df = pd.read_csv(train_file, header=None) if not _peek_columns(train_file)[1] else pd.read_csv(train_file)
+        if train_raw_df.shape[1] == 2:
+            train_seqs = train_raw_df.iloc[:, 0].astype(str).values
+        else:
+            train_seqs = train_raw_df.iloc[:, 1].astype(str).values
+
+        train_seq_set = build_seq_set(train_seqs)
+
+        ncols, has_h = _peek_columns(_anell_test)
+        anell_raw_df = pd.read_csv(_anell_test) if has_h else pd.read_csv(_anell_test, header=None)
+        if anell_raw_df.shape[1] == 2:
+            a_seqs = anell_raw_df.iloc[:, 0].astype(str).values
+            a_lbls = anell_raw_df.iloc[:, 1].astype(float).values
+        else:
+            a_seqs = anell_raw_df.iloc[:, 1].astype(str).values
+            a_lbls = anell_raw_df.iloc[:, 2].astype(float).values
+
+        keep_mask = [(str(s).upper() not in train_seq_set) for s in a_seqs]
+        clean_a_seqs = a_seqs[keep_mask]
+        clean_a_lbls = a_lbls[keep_mask]
+
+        tmp_clean_anell = os.path.join(
+            tempfile.gettempdir(), f"clean_fulle_test_anellovirus_cfg{args.config}.csv"
+        )
+        pd.DataFrame(
+            {0: range(len(clean_a_seqs)), 1: clean_a_seqs, 2: clean_a_lbls}
+        ).to_csv(tmp_clean_anell, header=False, index=False)
+
+        print(
+            f"  [i] Cleaned Anellovirus test dataset for FullE: retained {len(clean_a_seqs)} / {len(a_seqs)} samples.",
+            flush=True,
+        )
+        datasets_eval["test_anellovirus"] = CSVDataset(
+            tmp_clean_anell, transform="onehot_encoding"
+        ).get_dataloader(batch_size=128, shuffle=False)
 
     _sim_base_dir = os.path.join(args.data_folder, "SIM")
-    _sim_files = sorted(glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True))
+    _sim_files = sorted(
+        glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True)
+    )
     for _f in _sim_files:
         _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
         _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
@@ -531,7 +570,7 @@ def main():
     num_models = len(trained_model_paths)
 
     for dataset_name, dl in datasets_eval.items():
-        print(f"  [>] Processing Dataset: {dataset_name}...")
+        print(f"  [>] Processing Dataset: {dataset_name}...", flush=True)
 
         ensemble_probs_sum = None
         y_true_list = []
@@ -544,7 +583,6 @@ def main():
                 model = Branch(ptm_path)
 
             model.eval()
-            # Device configuration to prevent CPU/CUDA tensors mismatch
             model.set_best_available_device()
 
             model_logits = []
@@ -564,9 +602,10 @@ def main():
             model_probs = np.array(model_probs)
             model_logits = np.array(model_logits)
 
-            # Save individual submodel logits
             submodel_tag = _sanitize_submodel_name(rel_path)
-            submodel_filename = f"fulle_cfg{args.config}_{submodel_tag}_{dataset_name}.txt"
+            submodel_filename = (
+                f"fulle_cfg{args.config}_{submodel_tag}_{dataset_name}.txt"
+            )
             np.savetxt(
                 os.path.join(LOCAL_LOGITS_DIR, submodel_filename),
                 model_logits,
@@ -583,26 +622,32 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Save Sum-Rule ensemble predictions
         ensemble_filename = f"fulle_cfg{args.config}_sumrule_{dataset_name}.txt"
         save_file = os.path.join(LOCAL_LOGITS_DIR, ensemble_filename)
         np.savetxt(save_file, ensemble_probs_sum, fmt="%.6f")
-        print(f"  [✓] Logits for {num_models} submodels + sum-rule ensemble saved for '{dataset_name}'")
+        print(
+            f"  [✓] Logit dei {num_models} modelli + ensemble sum-rule salvati per '{dataset_name}'",
+            flush=True,
+        )
 
-        # Metric computation
         if len(y_true_list) == len(ensemble_probs_sum):
             y_true = np.array(y_true_list)
             probs_normalized = ensemble_probs_sum / num_models
 
             try:
                 auc_score = score_fn(y_true, probs_normalized)[0]
-                precision, recall, _ = precision_recall_curve(y_true, probs_normalized)
+                precision, recall, _ = precision_recall_curve(
+                    y_true, probs_normalized
+                )
                 auprc_score = auc(recall, precision)
                 f1 = f1_score(y_true, (probs_normalized >= 0.5).astype(int))
-                mcc = matthews_corrcoef(y_true, (probs_normalized >= 0.5).astype(int))
+                mcc = matthews_corrcoef(
+                    y_true, (probs_normalized >= 0.5).astype(int)
+                )
 
                 print(
-                    f"      Metrics ({dataset_name}): AUROC = {auc_score:.4f} | AUPRC = {auprc_score:.4f} | F1 = {f1:.4f} | MCC = {mcc:.4f}"
+                    f"      Metrics ({dataset_name}): AUROC = {auc_score:.4f} | AUPRC = {auprc_score:.4f} | F1 = {f1:.4f} | MCC = {mcc:.4f}",
+                    flush=True,
                 )
             except Exception:
                 pass

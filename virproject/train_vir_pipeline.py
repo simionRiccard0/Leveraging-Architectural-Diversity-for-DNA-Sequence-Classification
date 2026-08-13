@@ -12,9 +12,19 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
-# ========================================== #
-# 1. CLI ARGUMENT PARSING                   #
-# ========================================== #
+RC_TRANS = str.maketrans("ACGT", "TGCA")
+
+
+def build_seq_set(seq_iterable):
+    """Generates a fast lookup set containing both forward and reverse-complement sequences."""
+    s = set()
+    for seq in seq_iterable:
+        seq_str = str(seq).upper()
+        s.add(seq_str)
+        s.add(seq_str.translate(RC_TRANS)[::-1])
+    return s
+
+
 parser = argparse.ArgumentParser(
     description="ViraExplorer Multi-Task Training Pipeline (DNA Sequence Classification)"
 )
@@ -23,26 +33,24 @@ parser.add_argument(
     type=str,
     required=True,
     choices=["A", "B", "C"],
-    help="Training configuration strategy (A, B, C)",
+    help="Configurazione di training (A, B, C)",
 )
 parser.add_argument(
     "--task",
     type=str,
     default="viral",
     choices=["viral", "ecoli", "enhancer", "anellovirus"],
-    help="Target biological training task (default: viral)",
+    help="Task biologico su cui addestrare il modello (default: viral)",
 )
 parser.add_argument(
     "--data_folder",
     "-d",
     default="/home/simionricc/datasets",
-    help="Root directory for external benchmark datasets",
+    help="Path alla cartella principale dei dataset",
 )
 args = parser.parse_args()
 
-# ========================================== #
-# 2. HYPERPARAMETER CONFIGURATIONS           #
-# ========================================== #
+
 CONFIG_MAP = {
     "A": {  # ViraExplorer Native Strategy
         "epochs": 120,
@@ -86,19 +94,16 @@ CONFIG_MAP = {
 }
 cfg = CONFIG_MAP[args.config]
 
-SAVE_DIR = "checkpoints"
+SAVE_DIR = "/home/simionricc/virproject/"
 BEST_MODEL_PATH = os.path.join(
     SAVE_DIR, f"best_vira_{args.task}_cfg_{args.config}.pth"
 )
-GLOBAL_LOGITS_DIR = "global_logits"
+GLOBAL_LOGITS_DIR = "/home/simionricc/global_logits"
 os.makedirs(GLOBAL_LOGITS_DIR, exist_ok=True)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# ========================================== #
-# 3. DATA LOADING HELPERS                    #
-# ========================================== #
+
 def _peek_columns(path):
-    """Detects header and column structure of CSV sequence files."""
     with open(path, "r") as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(",")
@@ -115,7 +120,6 @@ def _peek_columns(path):
 
 
 def load_seq_label_dataframe(path):
-    """Loads CSV file into a standardized DataFrame (index, sequence, label)."""
     ncols, has_header = _peek_columns(path)
     df = pd.read_csv(path) if has_header else pd.read_csv(path, header=None)
     if df.shape[1] == 2:
@@ -130,7 +134,6 @@ def load_seq_label_dataframe(path):
 
 
 def get_task_dataframes(task_name, base_dir):
-    """Retrieves train and validation splits for the specified task."""
     if task_name == "viral":
         train_path = "ViraMiner/data/DNA_data/fullset_train.csv"
         val_path = "ViraMiner/data/DNA_data/fullset_validation.csv"
@@ -151,8 +154,33 @@ def get_task_dataframes(task_name, base_dir):
         train_path = os.path.join(
             base_dir, "unseen_anell", "training_data_anell_300_binary.csv"
         )
+        full_df = load_seq_label_dataframe(train_path)
+
+        # Deduplicate Anellovirus training set against its test set (Remove overlapping sequences)
+        anell_test_path = os.path.join(
+            base_dir, "unseen_anell", "test_data_anell_300_binary.csv"
+        )
+        if os.path.exists(anell_test_path):
+            anell_test_df = load_seq_label_dataframe(anell_test_path)
+            test_seq_set = build_seq_set(anell_test_df.iloc[:, 1].values)
+            keep_mask = [
+                (str(s).upper() not in test_seq_set)
+                for s in full_df.iloc[:, 1].values
+            ]
+            removed_count = len(full_df) - sum(keep_mask)
+            full_df = full_df[keep_mask].reset_index(drop=True)
+            print(
+                f"[i] Filtered {removed_count} test-overlapping sequences from Anellovirus training split.",
+                flush=True,
+            )
+
+        full_df = full_df.sample(frac=1, random_state=2020).reset_index(drop=True)
+        n_val = int(len(full_df) * 0.2)
+        val_df = full_df.iloc[:n_val].reset_index(drop=True)
+        train_df = full_df.iloc[n_val:].reset_index(drop=True)
+        return train_df, val_df
     else:
-        raise ValueError(f"Invalid task: {task_name}")
+        raise ValueError(f"Task non valida: {task_name}")
 
     full_df = load_seq_label_dataframe(train_path)
     full_df = full_df.sample(frac=1, random_state=2020).reset_index(drop=True)
@@ -164,12 +192,10 @@ def get_task_dataframes(task_name, base_dir):
 
 train_df, val_df = get_task_dataframes(args.task, args.data_folder)
 print(
-    f"[i] Task: '{args.task}' | Config: '{args.config}' | Train samples: {len(train_df)} | Val samples: {len(val_df)}"
+    f"[i] Task: '{args.task}' | Config: '{args.config}' | Train samples: {len(train_df)} | Val samples: {len(val_df)}",
+    flush=True,
 )
 
-# ========================================== #
-# 4. DATA AUGMENTATION & DATASET CLASS       #
-# ========================================== #
 mapping = {
     "A": [1, 0, 0, 0],
     "C": [0, 1, 0, 0],
@@ -181,7 +207,6 @@ MAX_LEN = 300
 
 
 def mutate_sequence(seq, n_mutations=40):
-    """Applies online random point mutations to the DNA sequence."""
     seq_list = list(seq)
     seq_len = len(seq_list)
     nucleotides = ["A", "C", "G", "T"]
@@ -194,7 +219,6 @@ def mutate_sequence(seq, n_mutations=40):
 
 
 def encode_sequence(seq, augment_type):
-    """Applies augmentation, truncates/pads to MAX_LEN, and converts to One-Hot."""
     seq = seq.upper()
     if augment_type == "rc_shift":
         complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
@@ -249,11 +273,7 @@ val_loader = DataLoader(
 )
 
 
-# ========================================== #
-# 5. VIRAEXPLORER ARCHITECTURE               #
-# ========================================== #
 class PatternBranch(nn.Module):
-    """Multi-kernel 1D CNN branch with Max Pooling for local motif discovery."""
     def __init__(self, dropout):
         super().__init__()
         self.conv6, self.conv12 = nn.Conv1d(
@@ -284,7 +304,6 @@ class PatternBranch(nn.Module):
 
 
 class FrequencyBranch(nn.Module):
-    """Multi-kernel 1D CNN branch with Average Pooling for base composition."""
     def __init__(self, dropout):
         super().__init__()
         self.conv6, self.conv12 = nn.Conv1d(
@@ -315,7 +334,6 @@ class FrequencyBranch(nn.Module):
 
 
 class TransformerBranch(nn.Module):
-    """Transformer Encoder branch for global positional context."""
     def __init__(
         self, d_model=256, nhead=8, num_layers=4, max_len=300, dropout=0.1
     ):
@@ -347,7 +365,6 @@ class TransformerBranch(nn.Module):
 
 
 class ViraExplorer(nn.Module):
-    """Tri-branch hybrid architecture integrating Pattern, Frequency, and Transformer modules."""
     def __init__(self, cnn_drop, trans_drop, out_features):
         super().__init__()
         self.pattern = PatternBranch(cnn_drop)
@@ -372,11 +389,8 @@ class ViraExplorer(nn.Module):
         )
 
 
-# ========================================== #
-# 6. LOSS & OPTIMIZER SETUP                 #
-# ========================================== #
+
 class FocalLoss(nn.Module):
-    """Focal Loss with label smoothing for class imbalance handling."""
     def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.05):
         super().__init__()
         self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
@@ -445,14 +459,11 @@ else:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, aiayn_lambda)
 
-# ========================================== #
-# 7. ADAPTIVE TRAINING LOOP                  #
-# ========================================== #
+
 best_auc = 0
 counter = 0
 scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else None
 
-# Config A warm-up: freeze transformer during first 5 epochs
 if args.config == "A":
     for p in model.transformer.parameters():
         p.requires_grad = False
@@ -461,14 +472,13 @@ for epoch in range(cfg["epochs"]):
     if args.config == "A" and epoch == 5:
         for p in model.transformer.parameters():
             p.requires_grad = True
-        print("Transformer branch unfreezed after warm-up.")
+        print("Transformer sbloccato dopo il warmup.", flush=True)
 
     model.train()
     for X_batch, y_batch in train_loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
 
-        # Target reshaping for BCE loss alignment
         if cfg["loss"] == "bce":
             y_batch_loss = y_batch.unsqueeze(1)
         else:
@@ -504,7 +514,7 @@ for epoch in range(cfg["epochs"]):
             targets_list.extend(y_batch.cpu().numpy().flatten())
 
     auc = roc_auc_score(targets_list, preds)
-    print(f"Epoch {epoch + 1}/{cfg['epochs']} | Val AUC: {auc:.4f}")
+    print(f"Epoca {epoch + 1}/{cfg['epochs']} | Val AUC: {auc:.4f}", flush=True)
 
     if auc > best_auc:
         best_auc = auc
@@ -514,25 +524,22 @@ for epoch in range(cfg["epochs"]):
         counter += 1
 
     if cfg["early_stop"] and counter >= cfg["patience"]:
-        print(f"Early stopping triggered at epoch {epoch + 1}")
+        print(f"Early stopping intervenuto all'epoca {epoch + 1}", flush=True)
         break
 
 if not cfg["early_stop"]:
     torch.save(model.state_dict(), BEST_MODEL_PATH)
 
-# ========================================== #
-# 8. CASCADE EVALUATION & LOGIT EXPORT       #
-# ========================================== #
-print("\nStarting logit extraction...")
+
+print("\nInizio estrazione logit in formato TXT...", flush=True)
 model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=device))
 model.eval()
 
 
 def _find_single_csv(folder, label):
-    """Finds test CSV file in directory."""
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     if len(all_csvs) == 0:
-        print(f"[SKIP] '{label}': No CSV found in {folder}.")
+        print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.", flush=True)
         return None
     test_csvs = [f for f in all_csvs if "test" in os.path.basename(f).lower()]
     if test_csvs:
@@ -565,13 +572,31 @@ _enhancer_csv = _find_single_csv(
 if _enhancer_csv:
     DATASETS_TO_EVAL["test_enhancer"] = _enhancer_csv
 
+# Dynamic deduplication of Anellovirus test set against active train dataset
 _anell_test = os.path.join(
     args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv"
 )
 if os.path.exists(_anell_test):
-    DATASETS_TO_EVAL["test_anellovirus"] = _anell_test
+    anell_test_raw = load_seq_label_dataframe(_anell_test)
+    train_seq_set = build_seq_set(train_df.iloc[:, 1].values)
 
-# Generate unique keys for SIM datasets using relative path structure
+    keep_mask = [
+        (str(s).upper() not in train_seq_set)
+        for s in anell_test_raw.iloc[:, 1].values
+    ]
+    anell_clean_df = anell_test_raw[keep_mask].reset_index(drop=True)
+    removed_overlap = len(anell_test_raw) - len(anell_clean_df)
+    print(
+        f"[i] Anellovirus test evaluation dataset cleaned: {len(anell_clean_df)} / {len(anell_test_raw)} samples retained (removed {removed_overlap} train overlap).",
+        flush=True,
+    )
+
+    clean_anell_tmp = os.path.join(
+        SAVE_DIR, f"clean_test_anell_{args.task}.csv"
+    )
+    anell_clean_df.to_csv(clean_anell_tmp, index=False)
+    DATASETS_TO_EVAL["test_anellovirus"] = clean_anell_tmp
+
 _sim_base_dir = os.path.join(args.data_folder, "SIM")
 _sim_files = sorted(
     glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True)
@@ -581,10 +606,13 @@ for _f in _sim_files:
     _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
     _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
     if _key in _seen_sim_keys:
-        print(f"[WARN] Duplicate key '{_key}' for SIM files:\n"
-              f"       {_seen_sim_keys[_key]}\n"
-              f"       {_f}\n"
-              f"       First file will be overwritten.")
+        print(
+            f"[WARN] Chiave duplicata '{_key}' per i file SIM:\n"
+            f"       {_seen_sim_keys[_key]}\n"
+            f"       {_f}\n"
+            f"       Il primo file verrà sovrascritto: verifica la struttura di {_sim_base_dir}.",
+            flush=True,
+        )
     _seen_sim_keys[_key] = _f
     DATASETS_TO_EVAL[_key] = _f
 
@@ -592,7 +620,8 @@ with torch.no_grad():
     for name, path in DATASETS_TO_EVAL.items():
         if not os.path.exists(path):
             print(
-                f"[SKIP] '{name}': Path not found ({path})."
+                f"[SKIP] '{name}': path non trovato ({path}). Aggiorna DATASETS_TO_EVAL.",
+                flush=True,
             )
             continue
 
@@ -618,11 +647,12 @@ with torch.no_grad():
 
         save_path = os.path.join(GLOBAL_LOGITS_DIR, filename)
         np.savetxt(save_path, np.array(logits_list), fmt="%.6f")
-        print(f"Logits saved to: {save_path}")
+        print(f"Logit salvati in: {save_path}", flush=True)
 
-# ========================================== #
-# 9. CHECKPOINT CLEANUP                      #
-# ========================================== #
+
 if os.path.exists(BEST_MODEL_PATH):
     os.remove(BEST_MODEL_PATH)
-print("Temporary checkpoint removed successfully.")
+clean_tmp_file = os.path.join(SAVE_DIR, f"clean_test_anell_{args.task}.csv")
+if os.path.exists(clean_tmp_file):
+    os.remove(clean_tmp_file)
+print("Pesi temporanei (.pth) e file temporanei rimossi con successo.", flush=True)

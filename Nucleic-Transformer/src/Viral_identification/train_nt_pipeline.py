@@ -38,9 +38,17 @@ NUC_MAP[ord('C')] = 1
 NUC_MAP[ord('G')] = 2
 NUC_MAP[ord('T')] = 3
 
-# ========================================== #
-# 1. CLI ARGUMENT PARSING                    #
-# ========================================== #
+
+def build_seq_set(seq_iterable):
+    """Generates a fast lookup set containing both forward and reverse-complement sequences."""
+    s = set()
+    for seq in seq_iterable:
+        seq_str = str(seq).upper()
+        s.add(seq_str)
+        s.add(seq_str.translate(RC_TRANS)[::-1])
+    return s
+
+
 parser = argparse.ArgumentParser(
     description="Nucleic Transformer Multi-Task High-Performance Pipeline"
 )
@@ -67,9 +75,6 @@ parser.add_argument('--lr_scale', type=float, default=0.1)
 opts = parser.parse_args()
 args = opts
 
-# ========================================== #
-# 2. HYPERPARAMETER CONFIGURATIONS           #
-# ========================================== #
 CONFIG_MAP = {
     'A': {  # ViraExplorer Native Strategy
         'epochs': 120, 'early_stop': True, 'patience': 15, 'batch_size': 16,
@@ -96,9 +101,7 @@ checkpoints_folder = f'checkpoints_{args.task}_cfg_{args.config}'
 os.makedirs(checkpoints_folder, exist_ok=True)
 best_model_path = os.path.join(checkpoints_folder, 'best_model.pt')
 
-# ========================================== #
-# 3. DATA LOADING HELPERS                    #
-# ========================================== #
+
 def _peek_columns(path):
     with open(path, 'r') as fh:
         first_line = fh.readline().strip()
@@ -153,6 +156,26 @@ def get_task_dataframes(task_name, base_dir, viraminer_folder):
         train_path = os.path.join(base_dir, "enhancer", "bert_enhancer_dataset.csv")
     elif task_name == 'anellovirus':
         train_path = os.path.join(base_dir, "unseen_anell", "training_data_anell_300_binary.csv")
+        full_df = load_seq_label_dataframe(train_path)
+
+        # Deduplicate Anellovirus training set against its test set (Remove overlapping sequences)
+        anell_test_path = os.path.join(base_dir, "unseen_anell", "test_data_anell_300_binary.csv")
+        if os.path.exists(anell_test_path):
+            anell_test_df = load_seq_label_dataframe(anell_test_path)
+            test_seq_set = build_seq_set(anell_test_df.iloc[:, 1].values)
+            keep_mask = [
+                (str(s).upper() not in test_seq_set)
+                for s in full_df.iloc[:, 1].values
+            ]
+            removed_count = len(full_df) - sum(keep_mask)
+            full_df = full_df[keep_mask].reset_index(drop=True)
+            print(f"[i] Filtered {removed_count} test-overlapping sequences from Anellovirus training split.", flush=True)
+
+        full_df = full_df.sample(frac=1, random_state=2020).reset_index(drop=True)
+        n_val = int(len(full_df) * 0.2)
+        val_df = full_df.iloc[:n_val].reset_index(drop=True)
+        train_df = full_df.iloc[n_val:].reset_index(drop=True)
+        return train_df, val_df
     else:
         raise ValueError(f"Invalid task: {task_name}")
 
@@ -164,9 +187,6 @@ def get_task_dataframes(task_name, base_dir, viraminer_folder):
     return train_df, val_df
 
 
-# ========================================== #
-# 4. DATASET                                 #
-# ========================================== #
 class FastNTDataset(Dataset):
     def __init__(self, dataframe, augment_type='none', target_len=300):
         raw_seqs = dataframe.iloc[:, 1].values
@@ -231,8 +251,8 @@ class FastNTDataset(Dataset):
 # Load dataset splits
 train_df, val_df = get_task_dataframes(args.task, args.data_folder, args.viraminer_folder)
 
-# Micro-batching: batch size 8 for 'viral' to guarantee zero OOM on self-attention
-train_batch_size = 8 if args.task == 'viral' else cfg['batch_size']
+# Micro-batching: batch size 8 for 'viral' and 'anellovirus' to guarantee zero OOM on self-attention
+train_batch_size = 8 if args.task in ['viral', 'anellovirus'] else cfg['batch_size']
 
 print(f"[i] Task: '{args.task}' | Config: '{args.config}' | Input Length: {MAX_LEN} bp | "
       f"Train Batch Size: {train_batch_size} | Train: {len(train_df)} | Val: {len(val_df)}", flush=True)
@@ -254,9 +274,6 @@ val_loader = DataLoader(
     pin_memory=True
 )
 
-# ========================================== #
-# 5. LOSS FUNCTIONS & MODEL SETUP            #
-# ========================================== #
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.05):
         super().__init__()
@@ -303,11 +320,9 @@ elif cfg['lr_sched'] == 'step':
 else:
     scheduler = lr_AIAYN(optimizer, opts.ninp, opts.warmup_steps, opts.lr_scale)
 
-# ========================================== #
-# 6. TRAINING LOOP                           #
-# ========================================== #
-# Accumulate 4 steps for 'viral' (8 x 4 = effective batch size of 32)
-GRAD_ACCUM_STEPS = 4 if args.task == 'viral' else 2
+
+# Accumulate 4 steps for 'viral' and 'anellovirus' (8 x 4 = effective batch size of 32)
+GRAD_ACCUM_STEPS = 4 if args.task in ['viral', 'anellovirus'] else 2
 scaler = GradScaler()
 best_auc = 0
 counter = 0
@@ -328,7 +343,7 @@ for epoch in range(cfg['epochs']):
             labels = data['labels'].to(device, non_blocking=True).float().unsqueeze(1)
 
         with autocast():
-            output = model(src).float()  # Force FP32 output for numerical stability
+            output = model(src).float()
             if cfg['loss'] == 'ce':
                 loss = torch.mean(criterion(output, labels))
             else:
@@ -359,7 +374,7 @@ for epoch in range(cfg['epochs']):
     with torch.no_grad():
         for data in val_loader:
             src = data['data'].to(device, non_blocking=True).long()
-            out = model(src).float()  # Stable FP32 evaluation
+            out = model(src).float()
             if cfg['loss'] == 'ce':
                 probs = F.softmax(out, dim=1)[:, 1]
             else:
@@ -389,9 +404,7 @@ if not cfg['early_stop']:
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
-# ========================================== #
-# 7. CASCADE EVALUATION                      #
-# ========================================== #
+
 print("\nStarting high-speed logit extraction...", flush=True)
 model.load_state_dict(torch.load(best_model_path, map_location=device))
 model.eval()
@@ -456,9 +469,28 @@ _enhancer_csv = _find_single_csv(os.path.join(args.data_folder, "enhancer"), "te
 if _enhancer_csv:
     DATASETS_TO_EVAL['test_enhancer'] = _loader_from_csv(_enhancer_csv)
 
+# Dynamically filter Anellovirus test set against active training dataset to guarantee zero leakage
 _anell_test = os.path.join(args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv")
 if os.path.exists(_anell_test):
-    DATASETS_TO_EVAL['test_anellovirus'] = _loader_from_csv(_anell_test)
+    anell_test_raw = load_seq_label_dataframe(_anell_test)
+    train_seq_set = build_seq_set(train_df.iloc[:, 1].values)
+
+    keep_mask = [
+        (str(s).upper() not in train_seq_set)
+        for s in anell_test_raw.iloc[:, 1].values
+    ]
+    anell_clean_df = anell_test_raw[keep_mask].reset_index(drop=True)
+    removed_overlap = len(anell_test_raw) - len(anell_clean_df)
+    print(f"[i] Anellovirus test evaluation dataset cleaned: {len(anell_clean_df)} / {len(anell_test_raw)} samples retained (removed {removed_overlap} train overlap).", flush=True)
+
+    if len(anell_clean_df) > 0:
+        DATASETS_TO_EVAL['test_anellovirus'] = DataLoader(
+            FastNTDataset(anell_clean_df, augment_type='none'),
+            batch_size=32,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True
+        )
 else:
     print(f"[SKIP] 'test_anellovirus': Path not found ({_anell_test}).", flush=True)
 
@@ -475,7 +507,7 @@ with torch.no_grad():
         logits_list = []
         for data in loader:
             src = data['data'].to(device, non_blocking=True).long()
-            out = model(src).float()  # Stable FP32 evaluation
+            out = model(src).float()
             if cfg['loss'] == 'ce':
                 logits_equivalent = out[:, 1] - out[:, 0]
                 probs_flat = np.nan_to_num(logits_equivalent.cpu().numpy().flatten(), nan=0.0)
@@ -488,9 +520,7 @@ with torch.no_grad():
         np.savetxt(os.path.join(GLOBAL_LOGITS_DIR, filename), np.array(logits_list), fmt='%.6f')
         print(f"Logits saved: {filename}", flush=True)
 
-# ========================================== #
-# 8. CHECKPOINT CLEANUP                      #
-# ========================================== #
+
 if os.path.exists(checkpoints_folder):
     shutil.rmtree(checkpoints_folder)
 print("Temporary checkpoints folder removed successfully.", flush=True)
