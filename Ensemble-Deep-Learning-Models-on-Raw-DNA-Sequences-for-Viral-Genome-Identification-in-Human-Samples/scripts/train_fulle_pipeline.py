@@ -1,5 +1,4 @@
 import argparse
-import copy
 import glob
 import json
 import math
@@ -8,17 +7,16 @@ import random
 import sys
 import tempfile
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 from sklearn.metrics import (
     auc,
     f1_score,
     matthews_corrcoef,
     precision_recall_curve,
 )
+import torch
+import torch.nn as nn
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -27,19 +25,6 @@ from src.model.network import Branch, Merger
 from src.utils.create_model import create_model
 from src.utils.metrics import auroc as score_fn
 from src.utils.train_model import train_model
-
-RC_TRANS = str.maketrans("ACGT", "TGCA")
-
-
-def build_seq_set(seq_iterable):
-    """Generates a fast lookup set containing both forward and reverse-complement sequences."""
-    s = set()
-    for seq in seq_iterable:
-        seq_str = str(seq).upper()
-        s.add(seq_str)
-        s.add(seq_str.translate(RC_TRANS)[::-1])
-    return s
-
 
 BRANCHES = [
     "branch/frequency",
@@ -68,7 +53,7 @@ BRANCH_KEY_MAP = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="FullE Complete Ensemble Pipeline (10 Models x Config) - DEI Cluster"
+        description="FullE Complete Ensemble Pipeline (10 Models x Config)"
     )
     parser.add_argument(
         "--config",
@@ -78,16 +63,22 @@ def parse_args():
         help="Configurazione di training (A, B, C)",
     )
     parser.add_argument(
+        "--task",
+        type=str,
+        default="viral",
+        choices=["viral", "ecoli", "enhancer", "anellovirus"],
+        help="Task biologico (default: viral)",
+    )
+    parser.add_argument(
         "--viraminer_folder",
         default="dataset",
-        help="Path (relativo al repo, es. 'dataset') ai file nativi "
-        "fullset_train/validation/test.csv",
+        help="Path ai file nativi fullset_train/validation/test.csv",
     )
     parser.add_argument(
         "--data_folder",
         "-d",
         default="/home/simionricc/datasets",
-        help="Path alla cartella condivisa con ecoli/enhancer/SIM/unseen_anell",
+        help="Path alla cartella principale dei dataset",
     )
     parser.add_argument(
         "--template_dir",
@@ -100,11 +91,6 @@ def parse_args():
         "-o",
         default="results_fulle_ensemble",
         help="Directory di output per i checkpoint .ptm",
-    )
-    parser.add_argument(
-        "--logits_dir",
-        default=None,
-        help="Directory temporanea per i logit estratti (evita race conditions tra job)",
     )
     return parser.parse_args()
 
@@ -122,10 +108,8 @@ def seed_everything(seed=2020):
 def apply_tensor_augmentation(X, augment_type):
     if augment_type == "none":
         return X
-
     X = X.clone()
     B = X.shape[0]
-
     n_channels = X.shape[1] if X.shape[1] in (4, 5) else X.shape[2]
     channel_first = X.shape[1] in (4, 5)
     rc_perm = [3, 2, 1, 0, 4] if n_channels == 5 else [3, 2, 1, 0]
@@ -142,16 +126,16 @@ def apply_tensor_augmentation(X, augment_type):
                     X[i] = torch.roll(X[i], shifts=shift, dims=1)
         elif augment_type == "mutation":
             for i in range(B):
-                pos = np.random.choice(L, min(40, L), replace=False)
+                pos = np.random.choice(
+                    L, min(40, max(1, int(L * 0.13))), replace=False
+                )
                 for p in pos:
-                    current_channel = torch.argmax(X[i, :, p]).item()
-                    if current_channel >= 4:
+                    curr = torch.argmax(X[i, :, p]).item()
+                    if curr >= 4:
                         continue
-                    new_channel = np.random.choice(
-                        [c for c in range(4) if c != current_channel]
-                    )
+                    new_c = np.random.choice([c for c in range(4) if c != curr])
                     X[i, :, p] = 0.0
-                    X[i, new_channel, p] = 1.0
+                    X[i, new_c, p] = 1.0
     else:
         L = X.shape[1]
         if augment_type == "rc_shift":
@@ -164,16 +148,16 @@ def apply_tensor_augmentation(X, augment_type):
                     X[i] = torch.roll(X[i], shifts=shift, dims=0)
         elif augment_type == "mutation":
             for i in range(B):
-                pos = np.random.choice(L, min(40, L), replace=False)
+                pos = np.random.choice(
+                    L, min(40, max(1, int(L * 0.13))), replace=False
+                )
                 for p in pos:
-                    current_channel = torch.argmax(X[i, p, :]).item()
-                    if current_channel >= 4:
+                    curr = torch.argmax(X[i, p, :]).item()
+                    if curr >= 4:
                         continue
-                    new_channel = np.random.choice(
-                        [c for c in range(4) if c != current_channel]
-                    )
+                    new_c = np.random.choice([c for c in range(4) if c != curr])
                     X[i, p, :] = 0.0
-                    X[i, p, new_channel] = 1.0
+                    X[i, p, new_c] = 1.0
     return X
 
 
@@ -195,8 +179,10 @@ class AugmentedDataLoader:
     def __iter__(self):
         for batch in self.dataloader:
             if isinstance(batch, (tuple, list)):
-                X_aug = apply_tensor_augmentation(batch[0], self.augment_type)
-                yield (X_aug, batch[1])
+                yield (
+                    apply_tensor_augmentation(batch[0], self.augment_type),
+                    batch[1],
+                )
             else:
                 yield batch
 
@@ -236,15 +222,7 @@ def _peek_columns(path):
     with open(path, "r") as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(",")
-
-    def _is_number(s):
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-
-    has_header = not _is_number(fields[-1])
+    has_header = not any(c.isdigit() for c in fields[-1])
     return len(fields), has_header
 
 
@@ -275,28 +253,20 @@ def make_eval_loader(csv_path, normalize=False):
     return ds.get_dataloader(batch_size=128, shuffle=False)
 
 
-def _find_single_csv(folder, label):
+def _resolve_test_file(folder, default_name):
+    target = os.path.join(folder, default_name)
+    if os.path.exists(target):
+        return target
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
-    if len(all_csvs) == 0:
-        print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.", flush=True)
-        return None
     test_csvs = [f for f in all_csvs if "test" in os.path.basename(f).lower()]
-    if test_csvs:
-        return test_csvs[0]
-    return all_csvs[0]
+    return test_csvs[0] if test_csvs else (all_csvs[0] if all_csvs else None)
 
 
 def _find_json_config(folder_path):
     json_files = sorted(list(Path(folder_path).glob("*.json")))
     if not json_files:
-        raise FileNotFoundError(
-            f"Nessun file .json trovato nella directory: {folder_path}"
-        )
+        raise FileNotFoundError(f"Nessun .json in: {folder_path}")
     return json_files[0]
-
-
-def _sanitize_submodel_name(rel_path):
-    return rel_path.replace("/", "_")
 
 
 def main():
@@ -331,69 +301,110 @@ def main():
     }
     cfg = CONFIG_MAP[args.config]
 
-    cfg_ckpt_dir = Path(args.output_dir) / f"config_{args.config}"
+    cfg_ckpt_dir = (
+        Path(args.output_dir) / f"{args.task}" / f"config_{args.config}"
+    )
     os.makedirs(cfg_ckpt_dir, exist_ok=True)
+    GLOBAL_LOGITS_DIR = "/home/simionricc/global_logits"
+    os.makedirs(GLOBAL_LOGITS_DIR, exist_ok=True)
 
-    if args.logits_dir is not None:
-        LOCAL_LOGITS_DIR = args.logits_dir
+    if args.task == "viral":
+        train_file = os.path.join(args.viraminer_folder, "fullset_train.csv")
+        valid_file = os.path.join(
+            args.viraminer_folder, "fullset_validation.csv"
+        )
+        if not os.path.exists(train_file):
+            train_file = os.path.join(
+                args.data_folder, "DNA_data", "fullset_train.csv"
+            )
+            valid_file = os.path.join(
+                args.data_folder, "DNA_data", "fullset_validation.csv"
+            )
+        if not os.path.exists(train_file):
+            train_file = os.path.join(args.data_folder, "fullset_train.csv")
+            valid_file = os.path.join(
+                args.data_folder, "fullset_validation.csv"
+            )
+        norm_train = _normalize_to_temp_csv(train_file)
+        norm_val = _normalize_to_temp_csv(valid_file)
+
     else:
-        LOCAL_LOGITS_DIR = f"./global_logits_temp_{args.config}"
+        # Gestione unificata e robusta di E. coli, Enhancer e Anellovirus
+        if args.task == "anellovirus":
+            raw_path = os.path.join(
+                args.data_folder, "unseen_anell", "training_data_anell_300_binary.csv"
+            )
+        elif args.task == "ecoli":
+            raw_path = os.path.join(
+                args.data_folder, "ecoli", "ecoli_train_NT.csv"
+            )
+        elif args.task == "enhancer":
+            raw_path = os.path.join(
+                args.data_folder, "enhancer", "bert_enhancer_dataset.csv"
+            )
 
-    os.makedirs(LOCAL_LOGITS_DIR, exist_ok=True)
+        ncols, has_header = _peek_columns(raw_path)
+        df_raw = pd.read_csv(raw_path) if has_header else pd.read_csv(raw_path, header=None)
+        if df_raw.shape[1] == 2:
+            seqs = df_raw.iloc[:, 0].astype(str).values
+            labels = df_raw.iloc[:, 1].astype(float).values
+        else:
+            seqs = df_raw.iloc[:, 1].astype(str).values
+            labels = df_raw.iloc[:, 2].astype(float).values
 
-    train_file = os.path.join(args.viraminer_folder, "fullset_train.csv")
-    valid_file = os.path.join(args.viraminer_folder, "fullset_validation.csv")
-    test_file = os.path.join(args.viraminer_folder, "fullset_test.csv")
+        seqs = np.array([s.upper() for s in seqs])
+        full_df = pd.DataFrame({0: range(len(seqs)), 1: seqs, 2: labels})
+        full_df = full_df.sample(frac=1, random_state=2020).reset_index(drop=True)
+        full_df[0] = range(len(full_df))  # Re-indicizzazione esatta 3 colonne
 
-    train_df = CSVDataset(f"{train_file}", transform="onehot_encoding")
-    valid_df = CSVDataset(f"{valid_file}", transform="onehot_encoding")
-    test_df = CSVDataset(f"{test_file}", transform="onehot_encoding")
+        n_val = int(len(full_df) * 0.2)
+        norm_val = os.path.join(
+            tempfile.gettempdir(), f"val_{args.task}_{args.config}.csv"
+        )
+        norm_train = os.path.join(
+            tempfile.gettempdir(), f"train_{args.task}_{args.config}.csv"
+        )
+        full_df.iloc[:n_val].to_csv(norm_val, header=False, index=False)
+        full_df.iloc[n_val:].to_csv(norm_train, header=False, index=False)
+
+    train_df = CSVDataset(norm_train, transform="onehot_encoding")
+    valid_df = CSVDataset(norm_val, transform="onehot_encoding")
 
     raw_train_dl = train_df.get_dataloader(batch_size=128, shuffle=True)
     aug_train_dl = AugmentedDataLoader(raw_train_dl, cfg["augment"])
-
     dl_valid = valid_df.get_dataloader(batch_size=128, shuffle=False)
-    dl_test = test_df.get_dataloader(batch_size=128, shuffle=False)
+
+    print(
+        f"[i] FullE | Task: '{args.task}' | Config: '{args.config}' | Train: {len(train_df)} | Val: {len(valid_df)}",
+        flush=True,
+    )
 
     trained_model_paths = {}
 
     def train_one_network(model_infos, save_path, is_merger=False):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
         if "parameters" in model_infos:
             model_infos["parameters"]["dropout_prob"] = cfg["dropout"]
 
         model = create_model(model_infos)
-
         if is_merger and isinstance(model, Merger):
             model.set_branches_trainability(False)
-            trainable_names = [
-                name for name, p in model.named_parameters() if p.requires_grad
-            ]
-            print(
-                f"    [CHECK Merger Freezing] Parametri addestrabili: {trainable_names}",
-                flush=True,
-            )
 
         loss_fn = (
             ProbabilityFocalLoss() if cfg["loss"] == "focal" else SafeBCELoss()
         )
-
         trainable_params = filter(lambda p: p.requires_grad, model.parameters())
 
-        if cfg["lr_sched"] == "aiayn":
-            lr_base = 1.0
-        elif cfg["optimizer"] == "adamw":
-            lr_base = 1e-4
-        else:
-            lr_base = 0.001
-
-        if cfg["optimizer"] == "adamw":
-            optimizer = torch.optim.AdamW(
-                trainable_params, lr=lr_base, weight_decay=1e-4
-            )
-        else:
-            optimizer = torch.optim.Adam(trainable_params, lr=lr_base)
+        lr_base = (
+            1.0
+            if cfg["lr_sched"] == "aiayn"
+            else (1e-4 if cfg["optimizer"] == "adamw" else 0.001)
+        )
+        optimizer = (
+            torch.optim.AdamW(trainable_params, lr=lr_base, weight_decay=1e-4)
+            if cfg["optimizer"] == "adamw"
+            else torch.optim.Adam(trainable_params, lr=lr_base)
+        )
 
         if cfg["lr_sched"] == "cosine":
 
@@ -405,7 +416,6 @@ def main():
                 )
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
         elif cfg["lr_sched"] == "aiayn":
             steps_per_epoch = len(raw_train_dl)
 
@@ -413,26 +423,26 @@ def main():
                 step = max(1, (epoch + 1) * steps_per_epoch)
                 d_model = 512
                 warmup_steps = 4000
-                return (d_model**-0.5) * min(step**-0.5, step * (warmup_steps**-1.5))
+                return (d_model**-0.5) * min(
+                    step**-0.5, step * (warmup_steps**-1.5)
+                )
 
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, aiayn_epoch_lr)
-
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, aiayn_epoch_lr
+            )
         else:
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer, step_size=5, gamma=0.5
             )
 
-        current_train_dl = raw_train_dl if is_merger else aug_train_dl
-
-        epsilon = model_infos.get("epsilon", 0)
         train_model(
             model,
-            train_dl=current_train_dl,
+            train_dl=(raw_train_dl if is_merger else aug_train_dl),
             loss_fn=loss_fn,
             optimizer=optimizer,
             scheduler=scheduler,
             epochs=cfg["epochs"],
-            epsilon=epsilon,
+            epsilon=model_infos.get("epsilon", 0),
             min_score=0,
             validation_fn=score_fn,
             val_dl=dl_valid,
@@ -442,215 +452,122 @@ def main():
         model.save_model(save_path)
         return save_path
 
-    # STEP 1: Addestramento / Recupero dei 5 Branch
-    print(
-        f"\n[>>>] STEP 1: Addestramento / Recupero dei 5 Branch per Config {args.config}",
-        flush=True,
-    )
+    # Step 1: Branches
     for branch_rel in BRANCHES:
         folder_path = Path(args.template_dir) / branch_rel
         json_path = _find_json_config(folder_path)
         model_infos = json.loads(json_path.read_text())
         if isinstance(model_infos, list):
             model_infos = model_infos[0]
-
         save_ptm = cfg_ckpt_dir / branch_rel / "model.ptm"
-        if save_ptm.exists():
-            print(
-                f"  [=] Branch '{branch_rel}' già addestrato. Salto training.",
-                flush=True,
-            )
-        else:
-            print(f"  [+] Training Branch: {branch_rel}...", flush=True)
+        if not save_ptm.exists():
             train_one_network(model_infos, str(save_ptm), is_merger=False)
-
         trained_model_paths[branch_rel] = str(save_ptm)
 
-    # STEP 2: Addestramento / Recupero dei 5 Merger
-    print(
-        f"\n[>>>] STEP 2: Addestramento / Recupero dei 5 Merger per Config {args.config}",
-        flush=True,
-    )
+    # Step 2: Mergers
     for merger_rel in MERGERS:
         folder_path = Path(args.template_dir) / merger_rel
         json_path = _find_json_config(folder_path)
         model_infos = json.loads(json_path.read_text())
         if isinstance(model_infos, list):
             model_infos = model_infos[0]
-
-        branches_dict = model_infos["parameters"]["branches_dict"]
-        updated_dict = {}
-        for b_key in branches_dict.keys():
+        for b_key in model_infos["parameters"]["branches_dict"].keys():
             target_rel = BRANCH_KEY_MAP[b_key]
-            updated_dict[b_key] = trained_model_paths[target_rel]
-        model_infos["parameters"]["branches_dict"] = updated_dict
-
-        save_ptm = cfg_ckpt_dir / merger_rel / "model.ptm"
-        if save_ptm.exists():
-            print(
-                f"  [=] Merger '{merger_rel}' già addestrato. Salto training.",
-                flush=True,
+            model_infos["parameters"]["branches_dict"][b_key] = (
+                trained_model_paths[target_rel]
             )
-        else:
-            print(f"  [+] Training Merger: {merger_rel}...", flush=True)
+        save_ptm = cfg_ckpt_dir / merger_rel / "model.ptm"
+        if not save_ptm.exists():
             train_one_network(model_infos, str(save_ptm), is_merger=True)
-
         trained_model_paths[merger_rel] = str(save_ptm)
 
-    # STEP 3: Estrazione Logit (per singolo modello + sum-rule ensemble)
-    print(
-        f"\n[>>>] STEP 3: Estrazione Logit ed Ensemble per Config {args.config}",
-        flush=True,
-    )
+    # Step 3: Targeted Cascade Evaluation (Solo i test set rilevanti)
+    print("\n--- Targeted Test Evaluation ---", flush=True)
+    datasets_eval = {}
 
-    datasets_eval = {"val": dl_valid, "test_VM": dl_test}
+    if args.task == "viral":
+        vm_test = os.path.join(args.data_folder, "fullset_test.csv")
+        if not os.path.exists(vm_test):
+            vm_test = os.path.join(args.data_folder, "DNA_data", "fullset_test.csv")
+        if not os.path.exists(vm_test):
+            vm_test = os.path.join(args.viraminer_folder, "fullset_test.csv")
+        if os.path.exists(vm_test):
+            datasets_eval["test_VM"] = make_eval_loader(vm_test, normalize=True)
 
-    _ecoli_csv = _find_single_csv(
-        os.path.join(args.data_folder, "ecoli"), "test_ecoli"
-    )
-    if _ecoli_csv:
-        datasets_eval["test_ecoli"] = make_eval_loader(_ecoli_csv, normalize=True)
+        _sim_base_dir = os.path.join(args.data_folder, "SIM")
+        if os.path.exists(_sim_base_dir):
+            for _f in sorted(
+                glob.glob(
+                    os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True
+                )
+            ):
+                _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
+                _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
+                datasets_eval[_key] = make_eval_loader(_f, normalize=True)
 
-    _enhancer_csv = _find_single_csv(
-        os.path.join(args.data_folder, "enhancer"), "test_enhancer"
-    )
-    if _enhancer_csv:
-        datasets_eval["test_enhancer"] = make_eval_loader(_enhancer_csv, normalize=True)
-
-    # Deduplicate Anellovirus test set against fullset_train to eliminate data leakage
-    _anell_test = os.path.join(
-        args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv"
-    )
-    if os.path.exists(_anell_test) and os.path.exists(train_file):
-        train_raw_df = pd.read_csv(train_file, header=None) if not _peek_columns(train_file)[1] else pd.read_csv(train_file)
-        if train_raw_df.shape[1] == 2:
-            train_seqs = train_raw_df.iloc[:, 0].astype(str).values
-        else:
-            train_seqs = train_raw_df.iloc[:, 1].astype(str).values
-
-        train_seq_set = build_seq_set(train_seqs)
-
-        ncols, has_h = _peek_columns(_anell_test)
-        anell_raw_df = pd.read_csv(_anell_test) if has_h else pd.read_csv(_anell_test, header=None)
-        if anell_raw_df.shape[1] == 2:
-            a_seqs = anell_raw_df.iloc[:, 0].astype(str).values
-            a_lbls = anell_raw_df.iloc[:, 1].astype(float).values
-        else:
-            a_seqs = anell_raw_df.iloc[:, 1].astype(str).values
-            a_lbls = anell_raw_df.iloc[:, 2].astype(float).values
-
-        keep_mask = [(str(s).upper() not in train_seq_set) for s in a_seqs]
-        clean_a_seqs = a_seqs[keep_mask]
-        clean_a_lbls = a_lbls[keep_mask]
-
-        tmp_clean_anell = os.path.join(
-            tempfile.gettempdir(), f"clean_fulle_test_anellovirus_cfg{args.config}.csv"
+    elif args.task == "anellovirus":
+        anell_test = os.path.join(
+            args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv"
         )
-        pd.DataFrame(
-            {0: range(len(clean_a_seqs)), 1: clean_a_seqs, 2: clean_a_lbls}
-        ).to_csv(tmp_clean_anell, header=False, index=False)
+        if os.path.exists(anell_test):
+            datasets_eval["test_anellovirus"] = make_eval_loader(
+                anell_test, normalize=True
+            )
 
-        print(
-            f"  [i] Cleaned Anellovirus test dataset for FullE: retained {len(clean_a_seqs)} / {len(a_seqs)} samples.",
-            flush=True,
+    elif args.task == "ecoli":
+        ecoli_test = _resolve_test_file(
+            os.path.join(args.data_folder, "ecoli"), "ecoli_independent_test_NT.csv"
         )
-        datasets_eval["test_anellovirus"] = CSVDataset(
-            tmp_clean_anell, transform="onehot_encoding"
-        ).get_dataloader(batch_size=128, shuffle=False)
+        if ecoli_test:
+            datasets_eval["test_ecoli"] = make_eval_loader(
+                ecoli_test, normalize=True
+            )
 
-    _sim_base_dir = os.path.join(args.data_folder, "SIM")
-    _sim_files = sorted(
-        glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True)
-    )
-    for _f in _sim_files:
-        _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
-        _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
-        datasets_eval[_key] = make_eval_loader(_f, normalize=True)
-
-    num_models = len(trained_model_paths)
+    elif args.task == "enhancer":
+        enh_test = _resolve_test_file(
+            os.path.join(args.data_folder, "enhancer"),
+            "bert_enhancer_ind_test_set.csv",
+        )
+        if enh_test:
+            datasets_eval["test_enhancer"] = make_eval_loader(
+                enh_test, normalize=True
+            )
 
     for dataset_name, dl in datasets_eval.items():
-        print(f"  [>] Processing Dataset: {dataset_name}...", flush=True)
-
         ensemble_probs_sum = None
-        y_true_list = []
-        first_model_key = list(trained_model_paths.keys())[0]
-
         for rel_path, ptm_path in trained_model_paths.items():
-            if "merger" in rel_path:
-                model = Merger(ptm_path)
-            else:
-                model = Branch(ptm_path)
-
+            model = Merger(ptm_path) if "merger" in rel_path else Branch(ptm_path)
             model.eval()
             model.set_best_available_device()
 
-            model_logits = []
             model_probs = []
             with torch.no_grad():
                 for batch in dl:
-                    X = batch[0].to(model.device)
-                    y = batch[1]
-
-                    pred, logit = model(X)
+                    pred, _ = model(batch[0].to(model.device))
                     model_probs.extend(pred.cpu().numpy().flatten())
-                    model_logits.extend(logit.cpu().numpy().flatten())
-
-                    if rel_path == first_model_key:
-                        y_true_list.extend(y.numpy().flatten())
 
             model_probs = np.array(model_probs)
-            model_logits = np.array(model_logits)
 
-            submodel_tag = _sanitize_submodel_name(rel_path)
-            submodel_filename = (
-                f"fulle_cfg{args.config}_{submodel_tag}_{dataset_name}.txt"
+            ensemble_probs_sum = (
+                model_probs.copy()
+                if ensemble_probs_sum is None
+                else ensemble_probs_sum + model_probs
             )
-            np.savetxt(
-                os.path.join(LOCAL_LOGITS_DIR, submodel_filename),
-                model_logits,
-                fmt="%.6f",
-            )
-
-            if ensemble_probs_sum is None:
-                ensemble_probs_sum = model_probs.copy()
-            else:
-                ensemble_probs_sum += model_probs
-
             model.set_to_cpu()
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        ensemble_filename = f"fulle_cfg{args.config}_sumrule_{dataset_name}.txt"
-        save_file = os.path.join(LOCAL_LOGITS_DIR, ensemble_filename)
-        np.savetxt(save_file, ensemble_probs_sum, fmt="%.6f")
+        ens_name = f"fulle_cfg{args.config}_{args.task}_{dataset_name}.txt"
+        np.savetxt(
+            os.path.join(GLOBAL_LOGITS_DIR, ens_name),
+            ensemble_probs_sum,
+            fmt="%.6f",
+        )
         print(
-            f"  [✓] Logit dei {num_models} modelli + ensemble sum-rule salvati per '{dataset_name}'",
+            f" Logits saved ({len(ensemble_probs_sum)} samples): {ens_name}",
             flush=True,
         )
-
-        if len(y_true_list) == len(ensemble_probs_sum):
-            y_true = np.array(y_true_list)
-            probs_normalized = ensemble_probs_sum / num_models
-
-            try:
-                auc_score = score_fn(y_true, probs_normalized)[0]
-                precision, recall, _ = precision_recall_curve(
-                    y_true, probs_normalized
-                )
-                auprc_score = auc(recall, precision)
-                f1 = f1_score(y_true, (probs_normalized >= 0.5).astype(int))
-                mcc = matthews_corrcoef(
-                    y_true, (probs_normalized >= 0.5).astype(int)
-                )
-
-                print(
-                    f"      Metrics ({dataset_name}): AUROC = {auc_score:.4f} | AUPRC = {auprc_score:.4f} | F1 = {f1:.4f} | MCC = {mcc:.4f}",
-                    flush=True,
-                )
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":

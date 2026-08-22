@@ -6,27 +6,17 @@ import random
 import sys
 import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
-RC_TRANS = str.maketrans("ACGT", "TGCA")
-
-
-def build_seq_set(seq_iterable):
-    """Generates a fast lookup set containing both forward and reverse-complement sequences."""
-    s = set()
-    for seq in seq_iterable:
-        seq_str = str(seq).upper()
-        s.add(seq_str)
-        s.add(seq_str.translate(RC_TRANS)[::-1])
-    return s
-
-
+# ---------------------------------------------------------
+# ARGUMENT PARSER
+# ---------------------------------------------------------
 parser = argparse.ArgumentParser(
-    description="ViraExplorer Multi-Task Training Pipeline (DNA Sequence Classification)"
+    description="GenExplorer (ViraExplorer) Multi-Task Training Pipeline (DNA Sequence Classification)"
 )
 parser.add_argument(
     "--config",
@@ -50,9 +40,11 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-
+# ---------------------------------------------------------
+# CONFIGURATION MAP (C1, C2, C3)
+# ---------------------------------------------------------
 CONFIG_MAP = {
-    "A": {  # ViraExplorer Native Strategy
+    "A": {  # Strategy C1: Focal Loss + Cosine Warmup
         "epochs": 120,
         "early_stop": True,
         "patience": 15,
@@ -65,7 +57,7 @@ CONFIG_MAP = {
         "trans_dropout": 0.1,
         "out_features": 1,
     },
-    "B": {  # FullE Native Strategy
+    "B": {  # Strategy C2: BCE + StepLR (Deterministic)
         "epochs": 30,
         "early_stop": False,
         "patience": 0,
@@ -78,7 +70,7 @@ CONFIG_MAP = {
         "trans_dropout": 0.2,
         "out_features": 1,
     },
-    "C": {  # Nucleic Transformer Native Strategy
+    "C": {  # Strategy C3: CE + Noam (AIAYN) + Mutation Augmentation
         "epochs": 60,
         "early_stop": False,
         "patience": 0,
@@ -96,26 +88,32 @@ cfg = CONFIG_MAP[args.config]
 
 SAVE_DIR = "/home/simionricc/virproject/"
 BEST_MODEL_PATH = os.path.join(
-    SAVE_DIR, f"best_vira_{args.task}_cfg_{args.config}.pth"
+    SAVE_DIR, f"best_genexplorer_{args.task}_cfg_{args.config}.pth"
 )
 GLOBAL_LOGITS_DIR = "/home/simionricc/global_logits"
 os.makedirs(GLOBAL_LOGITS_DIR, exist_ok=True)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 
+def seed_everything(seed=2020):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+
+
+seed_everything(2020)
+
+# ---------------------------------------------------------
+# DATA LOADING & PREPROCESSING
+# ---------------------------------------------------------
 def _peek_columns(path):
     with open(path, "r") as fh:
         first_line = fh.readline().strip()
     fields = first_line.split(",")
-
-    def _is_number(s):
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-
-    has_header = not _is_number(fields[-1])
+    has_header = not any(c.isdigit() for c in fields[-1])
     return len(fields), has_header
 
 
@@ -138,47 +136,32 @@ def get_task_dataframes(task_name, base_dir):
         train_path = "ViraMiner/data/DNA_data/fullset_train.csv"
         val_path = "ViraMiner/data/DNA_data/fullset_validation.csv"
         if not os.path.exists(train_path):
+            train_path = os.path.join(base_dir, "DNA_data", "fullset_train.csv")
+            val_path = os.path.join(base_dir, "DNA_data", "fullset_validation.csv")
+        if not os.path.exists(train_path):
             train_path = os.path.join(base_dir, "fullset_train.csv")
             val_path = os.path.join(base_dir, "fullset_validation.csv")
         train_df = load_seq_label_dataframe(train_path)
         val_df = load_seq_label_dataframe(val_path)
-        return train_df, val_df
+        return train_df, val_df, 300
 
-    elif task_name == "ecoli":
-        train_path = os.path.join(base_dir, "ecoli", "ecoli_train_NT.csv")
-    elif task_name == "enhancer":
-        train_path = os.path.join(
-            base_dir, "enhancer", "bert_enhancer_dataset.csv"
-        )
     elif task_name == "anellovirus":
         train_path = os.path.join(
             base_dir, "unseen_anell", "training_data_anell_300_binary.csv"
         )
         full_df = load_seq_label_dataframe(train_path)
-
-        # Deduplicate Anellovirus training set against its test set (Remove overlapping sequences)
-        anell_test_path = os.path.join(
-            base_dir, "unseen_anell", "test_data_anell_300_binary.csv"
-        )
-        if os.path.exists(anell_test_path):
-            anell_test_df = load_seq_label_dataframe(anell_test_path)
-            test_seq_set = build_seq_set(anell_test_df.iloc[:, 1].values)
-            keep_mask = [
-                (str(s).upper() not in test_seq_set)
-                for s in full_df.iloc[:, 1].values
-            ]
-            removed_count = len(full_df) - sum(keep_mask)
-            full_df = full_df[keep_mask].reset_index(drop=True)
-            print(
-                f"[i] Filtered {removed_count} test-overlapping sequences from Anellovirus training split.",
-                flush=True,
-            )
-
         full_df = full_df.sample(frac=1, random_state=2020).reset_index(drop=True)
         n_val = int(len(full_df) * 0.2)
         val_df = full_df.iloc[:n_val].reset_index(drop=True)
         train_df = full_df.iloc[n_val:].reset_index(drop=True)
-        return train_df, val_df
+        return train_df, val_df, 300
+
+    elif task_name == "ecoli":
+        train_path = os.path.join(base_dir, "ecoli", "ecoli_train_NT.csv")
+        target_len = 81
+    elif task_name == "enhancer":
+        train_path = os.path.join(base_dir, "enhancer", "bert_enhancer_dataset.csv")
+        target_len = 200
     else:
         raise ValueError(f"Task non valida: {task_name}")
 
@@ -187,30 +170,31 @@ def get_task_dataframes(task_name, base_dir):
     n_val = int(len(full_df) * 0.2)
     val_df = full_df.iloc[:n_val].reset_index(drop=True)
     train_df = full_df.iloc[n_val:].reset_index(drop=True)
-    return train_df, val_df
+    return train_df, val_df, target_len
 
 
-train_df, val_df = get_task_dataframes(args.task, args.data_folder)
+train_df, val_df, TASK_SEQ_LEN = get_task_dataframes(args.task, args.data_folder)
 print(
-    f"[i] Task: '{args.task}' | Config: '{args.config}' | Train samples: {len(train_df)} | Val samples: {len(val_df)}",
+    f"[i] Task: '{args.task}' | Config: '{args.config}' | Seq Length L: {TASK_SEQ_LEN} bp | "
+    f"Train samples: {len(train_df)} | Val samples: {len(val_df)}",
     flush=True,
 )
 
-mapping = {
+MAPPING = {
     "A": [1, 0, 0, 0],
     "C": [0, 1, 0, 0],
     "G": [0, 0, 1, 0],
     "T": [0, 0, 0, 1],
     "N": [0, 0, 0, 0],
 }
-MAX_LEN = 300
 
 
 def mutate_sequence(seq, n_mutations=40):
     seq_list = list(seq)
     seq_len = len(seq_list)
     nucleotides = ["A", "C", "G", "T"]
-    pos_to_mutate = random.sample(range(seq_len), min(n_mutations, seq_len))
+    n_mut = min(n_mutations, max(1, int(seq_len * 0.13)))
+    pos_to_mutate = random.sample(range(seq_len), n_mut)
     for pos in pos_to_mutate:
         current_nuc = seq_list[pos]
         choices = [n for n in nucleotides if n != current_nuc]
@@ -218,7 +202,7 @@ def mutate_sequence(seq, n_mutations=40):
     return "".join(seq_list)
 
 
-def encode_sequence(seq, augment_type):
+def encode_sequence(seq, augment_type, target_len):
     seq = seq.upper()
     if augment_type == "rc_shift":
         complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
@@ -229,60 +213,64 @@ def encode_sequence(seq, augment_type):
     elif augment_type == "mutation":
         seq = mutate_sequence(seq, n_mutations=40)
 
-    seq = seq[:MAX_LEN]
-    encoded = [mapping.get(b, [0, 0, 0, 0]) for b in seq]
-    while len(encoded) < MAX_LEN:
+    seq = seq[:target_len]
+    encoded = [MAPPING.get(b, [0, 0, 0, 0]) for b in seq]
+    while len(encoded) < target_len:
         encoded.append([0, 0, 0, 0])
     return encoded
 
 
 class DNADataset(Dataset):
-    def __init__(self, dataframe, augment_type="none"):
+    def __init__(self, dataframe, augment_type="none", target_len=300):
         self.sequences = dataframe[1].values
         self.labels = dataframe[2].values
         self.augment_type = augment_type
+        self.target_len = target_len
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
         x = torch.tensor(
-            encode_sequence(self.sequences[idx], self.augment_type),
+            encode_sequence(
+                self.sequences[idx], self.augment_type, self.target_len
+            ),
             dtype=torch.float32,
         )
         if cfg["loss"] == "ce":
-            y = torch.tensor(self.labels[idx], dtype=torch.long)
+            y = torch.tensor(int(self.labels[idx]), dtype=torch.long)
         else:
             y = torch.tensor(self.labels[idx], dtype=torch.float32)
         return x, y
 
 
 train_loader = DataLoader(
-    DNADataset(train_df, augment_type=cfg["augment"]),
+    DNADataset(train_df, augment_type=cfg["augment"], target_len=TASK_SEQ_LEN),
     batch_size=cfg["batch_size"],
     shuffle=True,
     num_workers=2,
     pin_memory=True,
 )
 val_loader = DataLoader(
-    DNADataset(val_df, augment_type="none"),
+    DNADataset(val_df, augment_type="none", target_len=TASK_SEQ_LEN),
     batch_size=cfg["batch_size"],
     shuffle=False,
     num_workers=2,
     pin_memory=True,
 )
 
-
+# ---------------------------------------------------------
+# GENEXPLORER ARCHITECTURE
+# ---------------------------------------------------------
 class PatternBranch(nn.Module):
     def __init__(self, dropout):
         super().__init__()
-        self.conv6, self.conv12 = nn.Conv1d(
-            4, 512, 6, padding="same"
-        ), nn.Conv1d(4, 512, 12, padding="same")
-        self.conv18, self.conv24 = nn.Conv1d(
-            4, 512, 18, padding="same"
-        ), nn.Conv1d(4, 512, 24, padding="same")
-        self.bn, self.pool = nn.BatchNorm1d(2048), nn.AdaptiveMaxPool1d(1)
+        self.conv6 = nn.Conv1d(4, 512, 6, padding="same")
+        self.conv12 = nn.Conv1d(4, 512, 12, padding="same")
+        self.conv18 = nn.Conv1d(4, 512, 18, padding="same")
+        self.conv24 = nn.Conv1d(4, 512, 24, padding="same")
+        self.bn = nn.BatchNorm1d(2048)
+        self.pool = nn.AdaptiveMaxPool1d(1)
         self.fc = nn.Sequential(
             nn.Linear(2048, 512), nn.GELU(), nn.Dropout(dropout)
         )
@@ -306,13 +294,12 @@ class PatternBranch(nn.Module):
 class FrequencyBranch(nn.Module):
     def __init__(self, dropout):
         super().__init__()
-        self.conv6, self.conv12 = nn.Conv1d(
-            4, 256, 6, padding="same"
-        ), nn.Conv1d(4, 256, 12, padding="same")
-        self.conv18, self.conv24 = nn.Conv1d(
-            4, 256, 18, padding="same"
-        ), nn.Conv1d(4, 256, 24, padding="same")
-        self.bn, self.pool = nn.BatchNorm1d(1024), nn.AdaptiveAvgPool1d(1)
+        self.conv6 = nn.Conv1d(4, 256, 6, padding="same")
+        self.conv12 = nn.Conv1d(4, 256, 12, padding="same")
+        self.conv18 = nn.Conv1d(4, 256, 18, padding="same")
+        self.conv24 = nn.Conv1d(4, 256, 24, padding="same")
+        self.bn = nn.BatchNorm1d(1024)
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Sequential(
             nn.Linear(1024, 512), nn.GELU(), nn.Dropout(dropout)
         )
@@ -335,12 +322,11 @@ class FrequencyBranch(nn.Module):
 
 class TransformerBranch(nn.Module):
     def __init__(
-        self, d_model=256, nhead=8, num_layers=4, max_len=300, dropout=0.1
+        self, d_model=256, nhead=8, num_layers=4, max_len=512, dropout=0.1
     ):
         super().__init__()
-        self.embedding, self.pos_enc = nn.Linear(4, d_model), nn.Embedding(
-            max_len + 1, d_model
-        )
+        self.embedding = nn.Linear(4, d_model)
+        self.pos_enc = nn.Embedding(max_len + 1, d_model)
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -353,7 +339,8 @@ class TransformerBranch(nn.Module):
         self.transformer = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
         )
-        self.norm, self.out = nn.LayerNorm(d_model), nn.Linear(d_model, 512)
+        self.norm = nn.LayerNorm(d_model)
+        self.out = nn.Linear(d_model, 512)
 
     def forward(self, x):
         B, L, _ = x.shape
@@ -364,12 +351,14 @@ class TransformerBranch(nn.Module):
         return self.out(self.norm(self.transformer(x))[:, 0, :])
 
 
-class ViraExplorer(nn.Module):
-    def __init__(self, cnn_drop, trans_drop, out_features):
+class GenExplorer(nn.Module):
+    def __init__(self, cnn_drop, trans_drop, out_features, max_len=512):
         super().__init__()
         self.pattern = PatternBranch(cnn_drop)
         self.frequency = FrequencyBranch(cnn_drop)
-        self.transformer = TransformerBranch(dropout=trans_drop)
+        self.transformer = TransformerBranch(
+            dropout=trans_drop, max_len=max_len
+        )
         self.fc = nn.Sequential(
             nn.Linear(1536, 512),
             nn.GELU(),
@@ -389,7 +378,6 @@ class ViraExplorer(nn.Module):
         )
 
 
-
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.75, gamma=2.0, smoothing=0.05):
         super().__init__()
@@ -405,11 +393,15 @@ class FocalLoss(nn.Module):
         return (self.alpha * (1 - torch.exp(-bce)) ** self.gamma * bce).mean()
 
 
+# ---------------------------------------------------------
+# OPTIMIZER & SCHEDULER SETUP
+# ---------------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ViraExplorer(
+model = GenExplorer(
     cnn_drop=cfg["cnn_dropout"],
     trans_drop=cfg["trans_dropout"],
     out_features=cfg["out_features"],
+    max_len=max(512, TASK_SEQ_LEN),
 ).to(device)
 
 if cfg["loss"] == "focal":
@@ -459,7 +451,9 @@ else:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, aiayn_lambda)
 
-
+# ---------------------------------------------------------
+# TRAINING LOOP
+# ---------------------------------------------------------
 best_auc = 0
 counter = 0
 scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else None
@@ -472,17 +466,16 @@ for epoch in range(cfg["epochs"]):
     if args.config == "A" and epoch == 5:
         for p in model.transformer.parameters():
             p.requires_grad = True
-        print("Transformer sbloccato dopo il warmup.", flush=True)
+        print("[i] Transformer unfreezed post-warmup.", flush=True)
 
     model.train()
     for X_batch, y_batch in train_loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
 
-        if cfg["loss"] == "bce":
-            y_batch_loss = y_batch.unsqueeze(1)
-        else:
-            y_batch_loss = y_batch
+        y_batch_loss = (
+            y_batch.unsqueeze(1) if cfg["loss"] == "bce" else y_batch
+        )
 
         if scaler is not None:
             with torch.amp.autocast("cuda"):
@@ -506,15 +499,16 @@ for epoch in range(cfg["epochs"]):
     with torch.no_grad():
         for X_batch, y_batch in val_loader:
             out = model(X_batch.to(device))
-            if cfg["loss"] == "ce":
-                probs = F.softmax(out, dim=1)[:, 1]
-            else:
-                probs = torch.sigmoid(out)
+            probs = (
+                F.softmax(out, dim=1)[:, 1]
+                if cfg["loss"] == "ce"
+                else torch.sigmoid(out)
+            )
             preds.extend(probs.cpu().numpy().flatten())
             targets_list.extend(y_batch.cpu().numpy().flatten())
 
     auc = roc_auc_score(targets_list, preds)
-    print(f"Epoca {epoch + 1}/{cfg['epochs']} | Val AUC: {auc:.4f}", flush=True)
+    print(f"Epoch {epoch + 1}/{cfg['epochs']} | Val AUC: {auc:.4f}", flush=True)
 
     if auc > best_auc:
         best_auc = auc
@@ -524,110 +518,83 @@ for epoch in range(cfg["epochs"]):
         counter += 1
 
     if cfg["early_stop"] and counter >= cfg["patience"]:
-        print(f"Early stopping intervenuto all'epoca {epoch + 1}", flush=True)
+        print(f"Early stopping at epoch {epoch + 1}", flush=True)
         break
 
 if not cfg["early_stop"]:
     torch.save(model.state_dict(), BEST_MODEL_PATH)
 
-
-print("\nInizio estrazione logit in formato TXT...", flush=True)
+# ---------------------------------------------------------
+# TARGETED TEST EVALUATION (CORRETTO & CONDIZIONATO)
+# ---------------------------------------------------------
+print("\n--- Automatic Cascade Evaluation ---", flush=True)
 model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=device))
 model.eval()
 
 
-def _find_single_csv(folder, label):
+def _resolve_test_file(folder, default_name):
+    target = os.path.join(folder, default_name)
+    if os.path.exists(target):
+        return target
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
-    if len(all_csvs) == 0:
-        print(f"[SKIP] '{label}': nessun CSV trovato in {folder}.", flush=True)
-        return None
     test_csvs = [f for f in all_csvs if "test" in os.path.basename(f).lower()]
-    if test_csvs:
-        return test_csvs[0]
-    return all_csvs[0]
+    return test_csvs[0] if test_csvs else (all_csvs[0] if all_csvs else None)
 
 
-DATASETS_TO_EVAL = {
-    "val": (
-        "ViraMiner/data/DNA_data/fullset_validation.csv"
-        if os.path.exists("ViraMiner/data/DNA_data/fullset_validation.csv")
-        else os.path.join(args.data_folder, "fullset_validation.csv")
-    ),
-    "test_VM": (
-        "ViraMiner/data/DNA_data/fullset_test.csv"
-        if os.path.exists("ViraMiner/data/DNA_data/fullset_test.csv")
-        else os.path.join(args.data_folder, "fullset_test.csv")
-    ),
-}
+DATASETS_TO_EVAL = {}
 
-_ecoli_csv = _find_single_csv(
-    os.path.join(args.data_folder, "ecoli"), "test_ecoli"
-)
-if _ecoli_csv:
-    DATASETS_TO_EVAL["test_ecoli"] = _ecoli_csv
+if args.task == "viral":
+    vm_test = os.path.join(args.data_folder, "fullset_test.csv")
+    if not os.path.exists(vm_test):
+        vm_test = os.path.join(args.data_folder, "DNA_data", "fullset_test.csv")
+    if os.path.exists(vm_test):
+        DATASETS_TO_EVAL["test_VM"] = vm_test
 
-_enhancer_csv = _find_single_csv(
-    os.path.join(args.data_folder, "enhancer"), "test_enhancer"
-)
-if _enhancer_csv:
-    DATASETS_TO_EVAL["test_enhancer"] = _enhancer_csv
+    _sim_base_dir = os.path.join(args.data_folder, "SIM")
+    if os.path.exists(_sim_base_dir):
+        for _f in sorted(
+            glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True)
+        ):
+            _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
+            _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
+            DATASETS_TO_EVAL[_key] = _f
 
-# Dynamic deduplication of Anellovirus test set against active train dataset
-_anell_test = os.path.join(
-    args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv"
-)
-if os.path.exists(_anell_test):
-    anell_test_raw = load_seq_label_dataframe(_anell_test)
-    train_seq_set = build_seq_set(train_df.iloc[:, 1].values)
-
-    keep_mask = [
-        (str(s).upper() not in train_seq_set)
-        for s in anell_test_raw.iloc[:, 1].values
-    ]
-    anell_clean_df = anell_test_raw[keep_mask].reset_index(drop=True)
-    removed_overlap = len(anell_test_raw) - len(anell_clean_df)
-    print(
-        f"[i] Anellovirus test evaluation dataset cleaned: {len(anell_clean_df)} / {len(anell_test_raw)} samples retained (removed {removed_overlap} train overlap).",
-        flush=True,
+elif args.task == "anellovirus":
+    anell_test = os.path.join(
+        args.data_folder, "unseen_anell", "test_data_anell_300_binary.csv"
     )
+    if os.path.exists(anell_test):
+        DATASETS_TO_EVAL["test_anellovirus"] = anell_test
 
-    clean_anell_tmp = os.path.join(
-        SAVE_DIR, f"clean_test_anell_{args.task}.csv"
+elif args.task == "ecoli":
+    ecoli_test = _resolve_test_file(
+        os.path.join(args.data_folder, "ecoli"), "ecoli_independent_test_NT.csv"
     )
-    anell_clean_df.to_csv(clean_anell_tmp, index=False)
-    DATASETS_TO_EVAL["test_anellovirus"] = clean_anell_tmp
+    if ecoli_test:
+        DATASETS_TO_EVAL["test_ecoli"] = ecoli_test
 
-_sim_base_dir = os.path.join(args.data_folder, "SIM")
-_sim_files = sorted(
-    glob.glob(os.path.join(_sim_base_dir, "**", "*.csv"), recursive=True)
-)
-_seen_sim_keys = {}
-for _f in _sim_files:
-    _rel_noext = os.path.splitext(os.path.relpath(_f, _sim_base_dir))[0]
-    _key = "test_sim_" + _rel_noext.replace(os.sep, "_")
-    if _key in _seen_sim_keys:
-        print(
-            f"[WARN] Chiave duplicata '{_key}' per i file SIM:\n"
-            f"       {_seen_sim_keys[_key]}\n"
-            f"       {_f}\n"
-            f"       Il primo file verrà sovrascritto: verifica la struttura di {_sim_base_dir}.",
-            flush=True,
-        )
-    _seen_sim_keys[_key] = _f
-    DATASETS_TO_EVAL[_key] = _f
+elif args.task == "enhancer":
+    enh_test = _resolve_test_file(
+        os.path.join(args.data_folder, "enhancer"),
+        "bert_enhancer_ind_test_set.csv",
+    )
+    if enh_test:
+        DATASETS_TO_EVAL["test_enhancer"] = enh_test
 
 with torch.no_grad():
     for name, path in DATASETS_TO_EVAL.items():
-        if not os.path.exists(path):
-            print(
-                f"[SKIP] '{name}': path non trovato ({path}). Aggiorna DATASETS_TO_EVAL.",
-                flush=True,
-            )
+        if not path or not os.path.exists(path):
             continue
 
-        df = load_seq_label_dataframe(path)
+        df_eval = load_seq_label_dataframe(path)
+        eval_len = (
+            81
+            if "ecoli" in name
+            else (200 if "enhancer" in name else TASK_SEQ_LEN)
+        )
+
         loader = DataLoader(
-            DNADataset(df, augment_type="none"),
+            DNADataset(df_eval, augment_type="none", target_len=eval_len),
             batch_size=64,
             shuffle=False,
             num_workers=2,
@@ -636,23 +603,19 @@ with torch.no_grad():
         logits_list = []
         for X, _ in loader:
             out = model(X.to(device))
-            if cfg["loss"] == "ce":
-                logits_equivalent = out[:, 1] - out[:, 0]
-                logits_list.extend(logits_equivalent.cpu().numpy().flatten())
-            else:
-                logits_list.extend(out.cpu().numpy().flatten())
+            logits_val = (
+                (out[:, 1] - out[:, 0]) if cfg["loss"] == "ce" else out
+            )
+            logits_list.extend(logits_val.cpu().numpy().flatten())
 
-        task_prefix = f"_{args.task}" if args.task != "viral" else ""
-        filename = f"viraexplorer_cfg{args.config}{task_prefix}_{name}.txt"
-
+        filename = f"viraexplorer_cfg{args.config}_{args.task}_{name}.txt"
         save_path = os.path.join(GLOBAL_LOGITS_DIR, filename)
         np.savetxt(save_path, np.array(logits_list), fmt="%.6f")
-        print(f"Logit salvati in: {save_path}", flush=True)
-
+        print(
+            f"  Logits salvati ({len(logits_list)} campioni): {filename}",
+            flush=True,
+        )
 
 if os.path.exists(BEST_MODEL_PATH):
     os.remove(BEST_MODEL_PATH)
-clean_tmp_file = os.path.join(SAVE_DIR, f"clean_test_anell_{args.task}.csv")
-if os.path.exists(clean_tmp_file):
-    os.remove(clean_tmp_file)
-print("Pesi temporanei (.pth) e file temporanei rimossi con successo.", flush=True)
+print("Pipeline completata con successo.", flush=True)
