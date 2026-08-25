@@ -3,7 +3,7 @@
 
 """
 Dedicated fine-tuning pipeline for DNABERT2-CAMP genomic foundation model.
-Decoupled from inference: saves best model checkpoint to checkpoint_dir.
+Fully compliant with 4x3 Cross-Benchmarking (Strategies C1/A, C2/B, C3/C)[cite: 1, 2].
 """
 
 import argparse
@@ -55,9 +55,11 @@ def main():
 
     epochs_map = {"A": 40, "B": 20, "C": 30}
     total_epochs = epochs_map[args.config]
+    is_ce = (args.config == "C")
+    num_classes = 2 if is_ce else 1
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
-    print(f"[i] Fine-tuning DNABERT2-CAMP | Task: '{args.task}' | Config: '{args.config}' | Input: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
+    print(f"[i] Fine-tuning DNABERT2-CAMP | Task: '{args.task}' | Config: '{args.config}' (Classes: {num_classes}) | Input: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
@@ -68,7 +70,7 @@ def main():
     tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=pin_mem)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False, num_workers=2, pin_memory=pin_mem)
 
-    model = DNABERT2CAMP(model_name_or_path=args.model_name_or_path).to(device)
+    model = DNABERT2CAMP(model_name_or_path=args.model_name_or_path, num_classes=num_classes).to(device)
 
     # Differential Learning Rate Setup
     no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
@@ -91,10 +93,8 @@ def main():
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         optimizer = torch.optim.Adam(param_groups, eps=1e-8)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, len(tr_loader) * 5), gamma=0.5)
-    else:  # Config C
-        num_pos = sum(train_df["label"].values)
-        pos_weight = torch.tensor([(len(train_df) - num_pos) / max(num_pos, 1)], device=device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:  # Config C: True C3 (Cross-Entropy + Noam Inverse Sqrt LR)
+        criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(param_groups, eps=1e-8)
         warmup_steps = max(1, int(total_steps * 0.10))
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: (float(s + 1) / float(warmup_steps)) if (s < warmup_steps) else ((float(warmup_steps) / float(s + 1)) ** 0.5))
@@ -113,10 +113,11 @@ def main():
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
+            y_loss = labels.long() if is_ce else labels.float()
 
             with autocast():
                 logits = model(input_ids, mask)
-                loss = criterion(logits, labels)
+                loss = criterion(logits, y_loss)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -133,7 +134,7 @@ def main():
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 mask = batch["attention_mask"].to(device, non_blocking=True)
                 logits = model(input_ids, mask)
-                probs = torch.sigmoid(logits)
+                probs = F.softmax(logits, dim=1)[:, 1] if is_ce else torch.sigmoid(logits)
                 preds.extend(probs.cpu().numpy().flatten())
                 targets.extend(batch["label"].numpy().flatten())
 

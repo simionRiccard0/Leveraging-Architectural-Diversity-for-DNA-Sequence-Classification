@@ -84,7 +84,7 @@ def main():
         from transformers import AutoTokenizer
         from models.dnabert2_camp import DNABERT2CAMP
         tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
-        model = DNABERT2CAMP()
+        model = DNABERT2CAMP(num_classes=(2 if is_ce else 1))
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt)
         model.to(device).eval()
