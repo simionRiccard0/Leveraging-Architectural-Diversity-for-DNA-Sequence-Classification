@@ -2,9 +2,9 @@
 
 
 This repository implements a multi-domain benchmark to evaluate how diverse deep learning paradigms generalize across heterogeneous genomic sequence classification tasks directly from raw nucleotide sequences without manual feature extraction.
+The repository provides a dual execution framework: a decoupled workflow (strictly separating training/checkpointing from standalone inference) alongside monolithic end-to-end pipelines, ensuring complete experimental flexibility and post-hoc logit analysis across biological benchmarks.
 
 ---
-
 ## Research Objective
 
 While domain-specific models demonstrate strong performance in specialized genomic tasks, there remains a critical need for a systematic comparative analysis evaluating the trade-offs between **convolutional local motif extraction** and **attention-based global contextual modeling**.
@@ -19,14 +19,14 @@ The primary objective of this project is to benchmark pure CNNs, multi-branch hy
 
 ## Evaluated Neural Architectures
 
-We benchmark three distinct architectural paradigms, representing different trade-offs in motif locality, base frequency modeling, and attention mechanisms:
+We benchmark four distinct architectural paradigms, exploring the trade-offs between local motif discovery, nucleotide frequency modeling, and attention mechanisms:
 
 | Paradigm | Architecture | Core Structural Philosophy |
 | :--- | :--- | :--- |
-| **Hybrid Multi-Branch** | **ViraExplorer** | Combines multi-scale 1D convolutions (`PatternBranch` with max pooling and `FrequencyBranch` with average pooling) with a parallel 4-layer `TransformerBranch` to simultaneously capture local motifs, base frequencies, and global positional context via late MLP fusion. |
+| **Hybrid Multi-Branch** | **GenExplorer** | Combines multi-scale 1D convolutions (`PatternBranch` with max pooling and `FrequencyBranch` with average pooling) with a parallel 4-layer `TransformerBranch` to simultaneously capture local motifs, base frequencies, and global positional context via late MLP fusion. |
 | **Multi-Branch CNN Ensemble** | **FullE** | An ensemble of 1D CNN subnetworks featuring multi-scale convolutions and parameterized $L_p$ power-average pooling—which dynamically interpolates between mean pooling ($p=1$) and max pooling ($p \to \infty$). Submodels and merger networks are combined via a 10-model Sum-Rule decision fusion. |
 | **Convolutional Transformer** | **Nucleic Transformer** | Formulates sequence classification using 1D convolutional $k$-mer tokenization (kernels $k \in \{2..6\}$) to generate learnable $k$-mer tokens, followed by a 6-layer Transformer Encoder stack with global mean pooling. |
-
+|**Genomic Foundation Model** | **DNABERT2-CAMP** | Leverages the pre-trained DNABERT-2 (117M) transformer backbone fine-tuned alongside a CAMP (Convolutional Attention Motif Profiler) module—a 4-layer 1D CNN cascade coupled with Multi-Head Self-Attention for localized motif refinement. |
 ---
 
 ## Experimental Strategy: Configuration Cross-Benchmarking
@@ -77,59 +77,95 @@ Each configuration reflects the native loss, optimization, learning rate schedul
 * **Optimization Goal**: Attention-focused optimization with token-level noise regularization.
 * **Loss Function**: Cross-Entropy (CE) Loss.
 * **Optimizer & Schedule**: Adam optimizer with Noam (AIAYN) inverse-square-root learning rate schedule and warmup steps.
-* **Data Augmentation**: Online random nucleotide mutations ($n = 40$ mutated positions per sequence).
+* **Data Augmentation**: Stochastic mutation augmentation ($K = \min(40, \lfloor 0.13 \cdot L \rfloor)$ nucleotide substitutions per sequence).
 * **Training Protocol**: Fixed 60 epochs without early stopping.
 
 ---
 
 ## Benchmark Datasets & Tasks
 
-Models trained under each configuration are evaluated across a diverse suite of biological tasks:
+Models trained under each configuration are evaluated across 5 biological benchmarks:
 
-### ViraMiner (VM) Metagenomic Benchmark
+### DS-VM (Viral Metagenomic Benchmark)
 
-* **Task**: Identification of viral contigs from 300 bp NGS human biospecimen reads.
-* **Challenge**: Severe real-world class imbalance ($\approx 2%$ viral positive vs $98%$ host/bacterial background).
+* **Task**: Identification of viral contigs from 300 bp NGS human biospecimen reads under severe class imbalance ($\approx 2\%$ viral positive vs $98\%$ host/bacterial background). 
 
-### Bacterial Promoter Recognition (*E. coli*)
+### DS-ECO (Bacterial Promoters - E. coli)
 
 * **Task**: Binary classification of 81 bp promoter sequences centered around Transcription Start Sites (TSS), benchmarked on RegulonDB and extended datasets (DNABERT2-CAMP).
 
-### Human Enhancer Sequence Benchmark
+### DS-ENH (Human Enhancers)
 
-* **Task**: Functional annotation of 200 bp enhancer fragments across human cell lines (non-redundant set filtered via CD-HIT).
+* **Task**: Functional annotation of 200 bp enhancer fragments across human cell lines.
 
-### Out-of-Distribution (OOD) Anellovirus Benchmark
+### DS-OOD (Out-of-Distribution Anellovirus)
 
-* **Task**: Evaluation of model generalization when sequences from the *Anelloviridae* family are completely excluded from training/validation sets and evaluated exclusively during inference.
+* **Task**: Sequences from the Anelloviridae family are excluded from training/validation and tested exclusively at inference to measure out-of-distribution taxonomic transfer.
 
-### Synthetic Noise Robustness (SIM)
+### DS-SIM (Synthetic Noise Robustness)
 
 * **Task**: Assessment of error tolerance by injecting uniform substitution noise at 1%, 5%, and 10% mutation levels into test sequences across 5 independent random seeds per corruption level.
 
 ---
 
-## Unified Experimental Framework
+## Dual Execution Framework
 
-The repository is organized around three architecture-specific training pipelines:
+The repository supports two workflows depending on experimental and computational requirements:
 
 ```bash
-train_vir_pipeline.py
-train_fulle_pipeline.py
-train_nt_pipeline.py
+                        ┌───────────────────────────────┐
+                        │       EXECUTION OPTIONS       │
+                        └───────────────┬───────────────┘
+                                        │
+             ┌──────────────────────────┴──────────────────────────┐
+             ▼                                                     ▼
+┌─────────────────────────────┐                       ┌─────────────────────────────┐
+│ 1. DECOUPLED WORKFLOW       │                       │ 2. ALL-IN-ONE PIPELINES     │
+│ pipelines/train_<arch>.py   │                       │ pipelines/train_*_pipe.py   │
+└────────────┬────────────────┘                       └────────────┬────────────────┘
+             │ Saves Checkpoint (.pt)                              │
+             ▼                                                     │
+┌─────────────────────────────┐                                    │
+│ evaluation/evaluate.py      │                                    │
+└────────────┬────────────────┘                                    │
+             │                                                     │
+             └──────────────────────────┬──────────────────────────┘
+                                        ▼ Exports Raw Logits (.txt)
+                             ┌─────────────────────┐
+                             │    global_logits/   │
+                             └──────────┬──────────┘
+                                        ▼ Input for Benchmark Synthesis
+                             ┌─────────────────────┐
+                             │ compute_metrics.py  │
+                             └─────────────────────┘
+```
+### Option 1: Decoupled Workflow (Modular)
+Isolates training from inference. Models save only validated checkpoints in checkpoints/, while evaluate.py independently computes test predictions:
+```bash
+# 1. Train GenExplorer
+python pipelines/train_genexplorer.py --config A --task ecoli --data_folder ./datasets --checkpoint_dir ./checkpoints
+
+# 2. Standalone Inference
+python evaluation/evaluate.py --arch genexplorer --task ecoli --config A --checkpoint ./checkpoints/best_genexplorer_ecoli_A.pt --data_folder ./datasets --logits_dir ./global_logits
+
 ```
 
-Rather than providing independent training and inference scripts, each pipeline implements the complete experimental workflow for its corresponding architecture.
+### Option 2:All-in-One End-to-End Pipelines
+Executes training, validation, checkpoint selection, and automated cascade evaluation across all benchmark test sets in a single script run:
+```bash
+# End-to-End GenExplorer Execution
+python pipelines/train_genex_pipeline.py --config A --task ecoli --data_folder ./datasets
 
-For every execution, the selected pipeline:
+# End-to-End Nucleic Transformer Execution
+python pipelines/train_nt_pipeline.py --config A --task ecoli --data_folder ./datasets
 
-1. **Preprocesses Inputs**: Enforces a strict sequence length standardisation and cleans ambiguous base characters (e.g., `'N'`).
-2. **Trains the Model**: Fits the architecture using one of the three predefined configuration strategies (`A`, `B`, or `C`) on a specified biological task (`--task viral|ecoli|enhancer|anellovirus`).
-3. **Automates Cascade Evaluation**: Automatically evaluates the trained model across all 19 benchmark test sets upon training completion.
-4. **Exports Prediction Logits**: Saves raw prediction logits for every evaluation dataset and purges heavy weight checkpoints to optimize storage.
+# End-to-End DNABERT2-CAMP Execution
+python pipelines/train_dnabert2_camp_pipeline.py --config A --task ecoli --data_folder ./datasets
 
-This unified design ensures that all architectures are evaluated under the exact same experimental protocol while keeping architecture-specific implementations isolated.
+# End-to-End FullE Ensemble Execution
+python pipelines/train_fulle_pipeline.py --config A --task ecoli --data_folder ./datasets
 
+```
 ---
 
 ## Cross-Configuration Evaluation
@@ -145,21 +181,24 @@ This design enables a fair assessment of both architectural inductive biases and
 
 ---
 
-## Prediction Logits & Storage Strategy
+## Global Benchmark Synthesis
 
-Instead of storing only aggregate performance metrics or heavy deep learning model weights, every evaluation exports the raw prediction logits directly to a common:
-
+Both workflows export raw logits to
 ```
 global_logits/
 ```
-
+using the unified naming convention:
+```
+{architecture}_cfg{CONFIG}_{task}_{evaluation_dataset}.txt
+```
 directory using a standardized organization based on:
 
 * **Architecture**
 
-  * `viraexplorer`
+  * `genexplorer`
   * `fulle`
   * `nucleictransformer`
+  * `dnabert2camp`
 
 * **Training Configuration**
 
@@ -169,6 +208,7 @@ directory using a standardized organization based on:
 
 * **Training Task**
 
+  * `viral`
   * `ecoli`
   * `enhancer`
   * `anellovirus`
@@ -177,13 +217,9 @@ directory using a standardized organization based on:
 
   * `test_VM`
   * `test_ecoli`
+  * `test_enhancer`
+  * `test_anellovirus`
   * `test_sim_noise_5_seed_5002`
-
-Naming convention:
-
-```text
-{architecture}_cfg{CONFIG}_{task}_{evaluation_dataset}.txt
-```
 
 Saving raw logits rather than only final metrics allows:
 
@@ -198,29 +234,6 @@ The analysis scripts operate directly on the stored logits, making experimentati
 
 ---
 
-## End-to-End Workflow
+## Determinism & Reproducibility
+Global random seed is fixed to 2020 across all data splitters, tokenizers, and PyTorch backends to guarantee reproducible replication of all experimental results.
 
-```text
-                Select Architecture
-                         │
-                         ▼
-         train_<architecture>_pipeline.py
-                         │
-                         ▼
-              Configuration A / B / C
-                         │
-                         ▼
-                  Model Training
-                         │
-                         ▼
-           Automatic Cascade Evaluation
-                         │
-                         ▼
-              Prediction Logits (.txt)
-                         │
-                         ▼
-                  global_logits/
-                         │
-                         ▼
-          Analysis & Benchmarking Scripts
-```
