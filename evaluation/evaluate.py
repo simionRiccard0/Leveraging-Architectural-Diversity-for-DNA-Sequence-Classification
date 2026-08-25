@@ -3,8 +3,8 @@
 
 """
 Universal Standalone Inference Script:
-Loads trained checkpoints and extracts logit files for all test benchmarks.
-Supports: GenExplorer, Nucleic Transformer, DNABERT2-CAMP, and FullE Ensemble.
+Loads trained checkpoints and extracts logit files for all test benchmarks[cite: 16].
+Supports: GenExplorer, Nucleic Transformer, DNABERT2-CAMP, and FullE Ensemble[cite: 16].
 """
 
 import argparse
@@ -24,10 +24,10 @@ def evaluate_loader(model, loader, is_ce, is_dnabert, is_fulle, device):
         for batch in loader:
             if is_dnabert:
                 out = model(batch["input_ids"].to(device), batch["attention_mask"].to(device))
-            elif is_fulle:
-                out = model(batch["data"].to(device)).squeeze(-1)
             else:
-                out = model(batch["data"].to(device)).squeeze(-1)
+                out = model(batch["data"].to(device))
+                if not is_ce:
+                    out = out.squeeze(-1)
 
             logits_val = (out[:, 1] - out[:, 0]) if is_ce else out
             all_logits.extend(logits_val.cpu().numpy().flatten())
@@ -61,21 +61,22 @@ def main():
         cascade_dict = {"custom_test": args.test_csv}
 
     is_ce = (args.config == "C")
+    num_classes = 2 if is_ce else 1
     is_dnabert = (args.arch == "dnabert2camp")
     is_fulle = (args.arch == "fulle")
     tokenizer = None
 
-    # Lazy-loading modulare delle architetture per evitare conflitti di librerie
+    # Lazy-loading modulare delle architetture per isolare dipendenze e ambienti
     if args.arch == "genexplorer":
         from models.genexplorer import GenExplorer
-        model = GenExplorer(out_features=(2 if is_ce else 1), max_len=max(512, seq_len))
+        model = GenExplorer(out_features=num_classes, max_len=max(512, seq_len))
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt)
         model.to(device).eval()
 
     elif args.arch == "nucleictransformer":
         from models.nucleic_transformer import NucleicTransformer
-        model = NucleicTransformer(ntoken=4, nclass=(2 if is_ce else 1), ninp=512)
+        model = NucleicTransformer(ntoken=4, nclass=num_classes, ninp=512)
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt)
         model.to(device).eval()
@@ -84,7 +85,7 @@ def main():
         from transformers import AutoTokenizer
         from models.dnabert2_camp import DNABERT2CAMP
         tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
-        model = DNABERT2CAMP(num_classes=(2 if is_ce else 1))
+        model = DNABERT2CAMP(num_classes=num_classes)
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt)
         model.to(device).eval()
@@ -92,10 +93,10 @@ def main():
     elif args.arch == "fulle":
         from models.fulle import FullEBranch, FullEMerger
         ckpt = torch.load(args.checkpoint, map_location=device)
-        b_freq = FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg").to(device)
-        b_pat = FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="max").to(device)
-        b_lp = FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="lp").to(device)
-        merger = FullEMerger([b_freq, b_pat, b_lp]).to(device)
+        b_freq = FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", num_classes=num_classes).to(device)
+        b_pat = FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="max", num_classes=num_classes).to(device)
+        b_lp = FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="lp", num_classes=num_classes).to(device)
+        merger = FullEMerger([b_freq, b_pat, b_lp], num_classes=num_classes).to(device)
 
         b_freq.load_state_dict(ckpt["branch_freq"])
         b_pat.load_state_dict(ckpt["branch_pat"])

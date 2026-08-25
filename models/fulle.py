@@ -1,5 +1,5 @@
 """
-FullE: Multi-Branch Convolutional Neural Network Ensemble with Parameterized Lp Pooling[cite: 1, 5].
+FullE: Multi-Branch Convolutional Neural Network Ensemble with Parameterized Lp Pooling.
 """
 
 from typing import List
@@ -8,14 +8,13 @@ import torch.nn as nn
 
 
 class PowerAveragePooling1d(nn.Module):
-    """L_p Power-Average Pooling smoothly interpolating between Mean Pooling (p=1) and Max Pooling (p -> inf)[cite: 1, 5]."""
+    """L_p Power-Average Pooling smoothly interpolating between Mean (p=1) and Max Pooling (p -> inf)."""
 
     def __init__(self, init_p: float = 2.0):
         super().__init__()
         self.p = nn.Parameter(torch.tensor(float(init_p)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Expected shape: (Batch, Channels, Length)
         p = torch.clamp(self.p, min=1.0, max=15.0)
         x_clamped = torch.clamp(x, min=1e-6)
         x_pow = torch.pow(x_clamped, p)
@@ -24,7 +23,7 @@ class PowerAveragePooling1d(nn.Module):
 
 
 class FullEBranch(nn.Module):
-    """Single Convolutional Sub-Network Branch (Frequency, Pattern, or Lp-pooling)[cite: 1, 5]."""
+    """Single Convolutional Sub-Network Branch (Frequency, Pattern, or Lp-pooling)."""
 
     def __init__(
         self,
@@ -32,13 +31,15 @@ class FullEBranch(nn.Module):
         out_channels: int = 1200,
         kernel_size: int = 11,
         pool_type: str = "max",
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        num_classes: int = 1
     ):
         super().__init__()
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding="same")
         self.relu = nn.ReLU()
         self.bn = nn.BatchNorm1d(out_channels)
         self.pool_type = pool_type.lower()
+        self.num_classes = num_classes
         
         if self.pool_type == "max":
             self.pool = nn.AdaptiveMaxPool1d(1)
@@ -51,7 +52,7 @@ class FullEBranch(nn.Module):
             
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(out_channels, 1000)
-        self.classifier = nn.Linear(1000, 1)
+        self.classifier = nn.Linear(1000, num_classes)
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3 and x.shape[-1] in (4, 5):
@@ -67,37 +68,28 @@ class FullEBranch(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.extract_features(x)
-        return self.classifier(feat)
+        out = self.classifier(feat)
+        return out.squeeze(-1) if self.num_classes == 1 else out
 
 
 class FullEMerger(nn.Module):
-    """Multi-Branch Merger: Concatenates extracted feature embeddings from pre-trained branches[cite: 1, 5]."""
+    """Multi-Branch Merger concatenating extracted feature embeddings."""
 
-    def __init__(self, branches: List[FullEBranch], dropout: float = 0.2):
+    def __init__(self, branches: List[FullEBranch], dropout: float = 0.2, num_classes: int = 1):
         super().__init__()
         self.branches = nn.ModuleList(branches)
+        self.num_classes = num_classes
         total_dim = 1000 * len(branches)
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(total_dim, 500),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(500, 1)
+            nn.Linear(500, num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = [b.extract_features(x) for b in self.branches]
         h_fused = torch.cat(feats, dim=1)
-        return self.classifier(h_fused)
-
-
-class FullEEnsemble(nn.Module):
-    """FullE 10-Subnetwork Decision Fusion Ensemble using unweighted sum rule[cite: 1, 5]."""
-
-    def __init__(self, models: List[nn.Module]):
-        super().__init__()
-        self.models = nn.ModuleList(models)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        probs = [torch.sigmoid(m(x)) for m in self.models]
-        return torch.stack(probs, dim=0).mean(dim=0)
+        out = self.classifier(h_fused)
+        return out.squeeze(-1) if self.num_classes == 1 else out

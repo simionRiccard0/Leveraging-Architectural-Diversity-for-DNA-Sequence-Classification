@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Dedicated training pipeline for Nucleic Transformer (C1/A, C2/B, C3/C strategies)[cite: 7].
-Decoupled from inference: saves best validated model to checkpoint_dir[cite: 7].
+Dedicated training pipeline for Nucleic Transformer (C1/A, C2/B, C3/C strategies)[cite: 24].
+Decoupled from inference: saves best validated model to checkpoint_dir[cite: 24].
 """
 
 import argparse
@@ -112,16 +112,14 @@ def main():
         t0 = time.time()
 
         for batch in tr_loader:
-            if cfg["sched"] == "aiayn": scheduler.step()
             src = batch["data"].to(device, non_blocking=True).long()
             labels = batch["label"].to(device, non_blocking=True)
-            if cfg["loss"] != "ce":
-                labels = labels.float().unsqueeze(1)
+            y_loss = labels.long() if cfg["loss"] == "ce" else labels.float().unsqueeze(1)
 
             optimizer.zero_grad()
             with autocast():
                 output = model(src).float()
-                loss = torch.mean(criterion(output, labels)) if cfg["loss"] == "ce" else criterion(output, labels)
+                loss = torch.mean(criterion(output, y_loss)) if cfg["loss"] == "ce" else criterion(output, y_loss)
 
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
@@ -131,9 +129,13 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-            total_loss += loss.item()
 
-        if cfg["sched"] != "aiayn": scheduler.step()
+            # Corretto: aggiornamento scheduler per Noam/AIAYN dopo step dell'ottimizzatore
+            if cfg["sched"] == "aiayn":
+                scheduler.step()
+
+        if cfg["sched"] != "aiayn":
+            scheduler.step()
 
         model.eval()
         preds, targets = [], []
