@@ -110,79 +110,7 @@ Models trained under each configuration are evaluated across 5 biological benchm
 
 ## Dual Execution Framework
 
-The repository supports two workflows depending on experimental and computational requirements:
-
-```bash
-                        ┌───────────────────────────────┐
-                        │       EXECUTION OPTIONS       │
-                        └───────────────┬───────────────┘
-                                        │
-             ┌──────────────────────────┴──────────────────────────┐
-             ▼                                                     ▼
-┌─────────────────────────────┐                       ┌─────────────────────────────┐
-│ 1. DECOUPLED WORKFLOW       │                       │ 2. ALL-IN-ONE PIPELINES     │
-│ pipelines/train_<arch>.py   │                       │ pipelines/train_*_pipe.py   │
-└────────────┬────────────────┘                       └────────────┬────────────────┘
-             │ Saves Checkpoint (.pt)                              │
-             ▼                                                     │
-┌─────────────────────────────┐                                    │
-│ evaluation/evaluate.py      │                                    │
-└────────────┬────────────────┘                                    │
-             │                                                     │
-             └──────────────────────────┬──────────────────────────┘
-                                        ▼ Exports Raw Logits (.txt)
-                             ┌─────────────────────┐
-                             │    global_logits/   │
-                             └──────────┬──────────┘
-                                        ▼ Input for Benchmark Synthesis
-                             ┌─────────────────────┐
-                             │ compute_metrics.py  │
-                             └─────────────────────┘
-```
-### Option 1: Decoupled Workflow (Modular)
-Isolates training from inference. Models save only validated checkpoints in checkpoints/, while evaluate.py independently computes test predictions:
-```bash
-# 1. Train GenExplorer
-python pipelines/train_genexplorer.py --config A --task ecoli --data_folder ./datasets --checkpoint_dir ./checkpoints
-
-# 2. Standalone Inference
-python evaluation/evaluate.py --arch genexplorer --task ecoli --config A --checkpoint ./checkpoints/best_genexplorer_ecoli_A.pt --data_folder ./datasets --logits_dir ./global_logits
-
-```
-
-### Option 2:All-in-One End-to-End Pipelines
-Executes training, validation, checkpoint selection, and automated cascade evaluation across all benchmark test sets in a single script run:
-```bash
-# End-to-End GenExplorer Execution
-python pipelines/train_genex_pipeline.py --config A --task ecoli --data_folder ./datasets
-
-# End-to-End Nucleic Transformer Execution
-python pipelines/train_nt_pipeline.py --config A --task ecoli --data_folder ./datasets
-
-# End-to-End DNABERT2-CAMP Execution
-python pipelines/train_dnabert2_camp_pipeline.py --config A --task ecoli --data_folder ./datasets
-
-# End-to-End FullE Ensemble Execution
-python pipelines/train_fulle_pipeline.py --config A --task ecoli --data_folder ./datasets
-
-```
----
-
-## Cross-Configuration Evaluation
-
-Each architecture can be executed using any of the three optimization strategies described above.
-
-Consequently, the benchmark supports two complementary analyses:
-
-* **Intra-architecture comparison**: Evaluates how a single architecture behaves under different optimization strategies.
-* **Cross-architecture comparison**: Evaluates different architectures trained under the same optimization strategy.
-
-This design enables a fair assessment of both architectural inductive biases and optimization strategies.
-
----
-
-## Global Benchmark Synthesis
-
+The repository supports two workflows depending on experimental and computational requirements.
 Both workflows export raw logits to
 ```
 global_logits/
@@ -220,7 +148,123 @@ directory using a standardized organization based on:
   * `test_enhancer`
   * `test_anellovirus`
   * `test_sim_noise_5_seed_5002`
+  
+```bash
+                        ┌───────────────────────────────┐
+                        │       EXECUTION OPTIONS       │
+                        └───────────────┬───────────────┘
+                                        │
+             ┌──────────────────────────┴──────────────────────────┐
+             ▼                                                     ▼
+┌─────────────────────────────┐                       ┌──────────────────────────────────────┐
+│ 1. DECOUPLED WORKFLOW       │                       │ 2. ALL-IN-ONE PIPELINES              │
+│ pipelines/train_<arch>.py   │                       │ pipelines/train_<arch>_pipeline.py   │
+└────────────┬────────────────┘                       └────────────┬─────────────────────────┘
+             │ Saves Checkpoint (.pt)                              │
+             ▼                                                     │
+┌─────────────────────────────┐                                    │
+│ evaluation/evaluate.py      │                                    │
+└────────────┬────────────────┘                                    │
+             │                                                     │
+             └──────────────────────────┬──────────────────────────┘
+                                        ▼ Exports Raw Logits (.txt)
+                             ┌─────────────────────┐
+                             │    global_logits/   │
+                             └──────────┬──────────┘
+                                        ▼ Input for Benchmark Synthesis
+                             ┌─────────────────────┐
+                             │ compute_metrics.py  │
+                             └─────────────────────┘
 
+```
+
+
+### Option 1: Decoupled Workflow (Modular)
+Isolates training from inference. Trains the chosen model on the specified task and configuration. It tracks validation performance (AUROC) at each epoch, applies early stopping when configured, and saves the optimal weight parameters to the `checkpoint` directory, while evaluate.py loads the saved .pt checkpoint file, detects the test set(s) mapped to the selected task, performs inference, displays test metrics (AUROC, AUPRC, MCC), and saves raw prediction logits to `logits`directory:
+```bash
+# Example: Train GenExplorer on E. coli under Configuration A (C1)
+python pipelines/train_genexplorer.py \
+    --config A \
+    --task ecoli \
+    --data_folder ./datasets \
+    --checkpoint_dir ./checkpoints
+
+
+# Example: Evaluate the trained GenExplorer checkpoint
+python evaluation/evaluate.py \
+    --arch genexplorer \
+    --task ecoli \
+    --config A \
+    --checkpoint ./checkpoints/best_genexplorer_ecoli_A.pt \
+    --data_folder ./datasets \
+    --logits_dir ./global_logits
+
+# Example: Train Nucleic Transformer on Viral Metagenomics (300 bp) under Strategy C (C3)
+python pipelines/train_nucleic_transformer.py \
+    --config C \
+    --task viral \
+    --data_folder ./datasets \
+    --checkpoint_dir ./checkpoints
+
+# Example: Evaluate Nucleic Transformer across all 16 Viral test sets (DS-VM + 15 DS-SIM noise sets)
+python evaluation/evaluate.py \
+    --arch nucleictransformer \
+    --task viral \
+    --config C \
+    --checkpoint ./checkpoints/best_nucleictransformer_viral_C.pt \
+    --data_folder ./datasets \
+    --logits_dir ./global_logits
+```
+
+### Option 2:All-in-One End-to-End Pipelines
+This workflow bundles training, model selection, and multi-dataset test inference into a single automated script execution. It is primarily designed for automated HPC batch jobs (sbatch), running unattended experiments where a single command handles the full lifecycle from raw data to final logit files.
+*Automated Cascade Inference*: Upon completing training, the pipeline automatically detects and iterates through all matching test sets. 
+*Direct Logit Export*: Prediction logits are written directly into global_logits/ with standard nomenclature described above.
+
+```bash
+# 1. GenExplorer on Viral Metagenomics (Config A)
+# Evaluates on DS-VM and automatically cascades over all 15 DS-SIM noise sets (1%, 5%, 10%)
+python pipelines/train_genex_pipeline.py \
+    --config A \
+    --task viral \
+    --data_folder ./datasets
+
+# 2. Nucleic Transformer on Human Enhancers (Config C)
+# Evaluates directly on the independent enhancer test set
+python pipelines/train_nt_pipeline.py \
+    --config C \
+    --task enhancer \
+    --data_folder ./datasets
+
+# 3. DNABERT2-CAMP on Out-of-Distribution Anellovirus (Config A)
+# Evaluates generalization on unseen Anelloviridae families
+python pipelines/train_dnabert2_camp_pipeline.py \
+    --config A \
+    --task anellovirus \
+    --data_folder ./datasets
+
+# 4. FullE Ensemble on E. coli Promoters (Config B)
+# Trains frequency, pattern, and Lp-pooling branches, fits merger, and extracts test logits
+python pipelines/train_fulle_pipeline.py \
+    --config B \
+    --task ecoli \
+    --data_folder ./datasets
+
+```
+---
+
+## Cross-Configuration Evaluation
+
+Each architecture can be executed using any of the three optimization strategies described above.
+
+Consequently, the benchmark supports two complementary analyses:
+
+* **Intra-architecture comparison**: Evaluates how a single architecture behaves under different optimization strategies.
+* **Cross-architecture comparison**: Evaluates different architectures trained under the same optimization strategy.
+
+This design enables a fair assessment of both architectural inductive biases and optimization strategies.
+
+---
 Saving raw logits rather than only final metrics allows:
 
 * Reproducible post-hoc analyses.
