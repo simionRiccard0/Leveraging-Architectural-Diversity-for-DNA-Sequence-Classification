@@ -218,8 +218,8 @@ python evaluation/evaluate.py \
 
 ### Option 2:All-in-One End-to-End Pipelines
 This workflow bundles training, model selection, and multi-dataset test inference into a single automated script execution. It is primarily designed for automated HPC batch jobs (sbatch), running unattended experiments where a single command handles the full lifecycle from raw data to final logit files.
-*Automated Cascade Inference*: Upon completing training, the pipeline automatically detects and iterates through all matching test sets. 
-*Direct Logit Export*: Prediction logits are written directly into global_logits/ with standard nomenclature described above.
+* *Automated Cascade Inference*: Upon completing training, the pipeline automatically detects and iterates through all matching test sets. 
+* *Direct Logit Export*: Prediction logits are written directly into global_logits/ with standard nomenclature described above.
 
 ```bash
 # 1. GenExplorer on Viral Metagenomics (Config A)
