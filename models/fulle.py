@@ -1,10 +1,11 @@
 """
-FullE: Multi-Branch Convolutional Neural Network Ensemble with Parameterized Lp Pooling.
+FullE: 10-Subnetwork Convolutional Neural Network Ensemble with Parameterized Lp Pooling (Eq. 3).
 """
 
-from typing import List
+from typing import List, Dict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PowerAveragePooling1d(nn.Module):
@@ -40,7 +41,7 @@ class FullEBranch(nn.Module):
         self.bn = nn.BatchNorm1d(out_channels)
         self.pool_type = pool_type.lower()
         self.num_classes = num_classes
-        
+
         if self.pool_type == "max":
             self.pool = nn.AdaptiveMaxPool1d(1)
         elif self.pool_type == "avg":
@@ -49,7 +50,7 @@ class FullEBranch(nn.Module):
             self.pool = PowerAveragePooling1d(init_p=2.0)
         else:
             raise ValueError(f"Unsupported pooling type: {pool_type}")
-            
+
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(out_channels, 1000)
         self.classifier = nn.Linear(1000, num_classes)
@@ -73,7 +74,7 @@ class FullEBranch(nn.Module):
 
 
 class FullEMerger(nn.Module):
-    """Multi-Branch Merger concatenating extracted feature embeddings."""
+    """Multi-Branch Merger concatenating feature outputs from distinct branches."""
 
     def __init__(self, branches: List[FullEBranch], dropout: float = 0.2, num_classes: int = 1):
         super().__init__()
@@ -93,3 +94,33 @@ class FullEMerger(nn.Module):
         h_fused = torch.cat(feats, dim=1)
         out = self.classifier(h_fused)
         return out.squeeze(-1) if self.num_classes == 1 else out
+
+
+class FullE10Ensemble(nn.Module):
+    """
+    Complete FullE Ensemble Framework combining 10 heterogeneous subnetworks via Sum-Rule (Eq. 3 in Paper).
+    """
+
+    def __init__(self, branches: Dict[str, FullEBranch], mergers: Dict[str, FullEMerger], num_classes: int = 1):
+        super().__init__()
+        self.branches = nn.ModuleDict(branches)
+        self.mergers = nn.ModuleDict(mergers)
+        self.num_classes = num_classes
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        probs = []
+        is_ce = (self.num_classes == 2)
+        all_models = list(self.branches.values()) + list(self.mergers.values())
+
+        for m in all_models:
+            out = m(x)
+            p = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out)
+            probs.append(p)
+
+        # Unweighted average decision fusion (Sum-Rule: 1/10 sum P_m)
+        avg_prob = torch.stack(probs, dim=0).mean(dim=0)
+        eps = 1e-7
+        avg_prob = torch.clamp(avg_prob, min=eps, max=1.0 - eps)
+        # Convert to logit space for metric consistency
+        logit = torch.log(avg_prob / (1.0 - avg_prob))
+        return logit

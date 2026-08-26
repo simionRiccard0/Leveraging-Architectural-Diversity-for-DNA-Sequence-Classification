@@ -3,11 +3,12 @@
 
 """
 Dedicated fine-tuning pipeline for DNABERT2-CAMP genomic foundation model.
-Fully compliant with 4x3 Cross-Benchmarking (Strategies C1/A, C2/B, C3/C)[cite: 1, 2].
+Fully compliant with 4x3 Cross-Benchmarking (Strategies C1/A, C2/B, C3/C).
 """
 
 import argparse
 import os
+import sys
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
@@ -17,6 +18,8 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.dnabert2_camp import DNABERT2CAMP
 from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset
@@ -36,12 +39,17 @@ class BinaryFocalLoss(nn.Module):
         return (alpha_t * ((1.0 - p_t) ** self.gamma) * bce).mean()
 
 
+def get_default_model_path():
+    local_p = "/nfsd/nannidl/simionricc/models/dnabert2_camp/model"
+    return local_p if os.path.exists(local_p) else "zhihan1996/DNABERT-2-117M"
+
+
 def main():
     parser = argparse.ArgumentParser(description="DNABERT2-CAMP Fine-tuning Pipeline")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C"], help="Strategy: A (C1), B (C2), C (C3)")
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
-    parser.add_argument("--model_name_or_path", default="zhihan1996/DNABERT-2-117M")
+    parser.add_argument("--model_name_or_path", default=get_default_model_path())
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--backbone_lr", type=float, default=2e-5)
@@ -59,7 +67,7 @@ def main():
     num_classes = 2 if is_ce else 1
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
-    print(f"[i] Fine-tuning DNABERT2-CAMP | Task: '{args.task}' | Config: '{args.config}' (Classes: {num_classes}) | Input: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
+    print(f"[i] Fine-tuning DNABERT2-CAMP | Task: '{args.task}' | Config: '{args.config}' (Classes: {num_classes}) | Model: {args.model_name_or_path} | Train: {len(train_df)} | Val: {len(val_df)}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
@@ -72,7 +80,6 @@ def main():
 
     model = DNABERT2CAMP(model_name_or_path=args.model_name_or_path, num_classes=num_classes).to(device)
 
-    # Differential Learning Rate Setup
     no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
     param_groups = [
         {"params": [p for n, p in model.bert.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], "lr": args.backbone_lr, "weight_decay": 0.01},
@@ -93,7 +100,7 @@ def main():
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         optimizer = torch.optim.Adam(param_groups, eps=1e-8)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, len(tr_loader) * 5), gamma=0.5)
-    else:  # Config C: True C3 (Cross-Entropy + Noam Inverse Sqrt LR)
+    else:
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(param_groups, eps=1e-8)
         warmup_steps = max(1, int(total_steps * 0.10))
@@ -153,7 +160,7 @@ def main():
                 print(f"Early stopping triggered at epoch {epoch}.")
                 break
 
-    print(f"Checkpoint saved successfully: {best_path} (Best Val AUC: {best_auc:.4f})")
+    print(f"[✓] Checkpoint saved successfully: {best_path} (Best Val AUC: {best_auc:.4f})")
 
 
 if __name__ == "__main__":

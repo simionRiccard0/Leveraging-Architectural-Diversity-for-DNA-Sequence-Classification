@@ -3,18 +3,26 @@
 
 """
 Universal Standalone Inference Script:
-Loads trained checkpoints and extracts logit files for all test benchmarks[cite: 16].
-Supports: GenExplorer, Nucleic Transformer, DNABERT2-CAMP, and FullE Ensemble[cite: 16].
+Loads trained checkpoints and extracts logit files for all test benchmarks.
+Supports: GenExplorer, Nucleic Transformer, DNABERT2-CAMP, and FullE 10-Model Sum-Rule Ensemble (Eq. 3).
 """
 
 import argparse
 import os
+import sys
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
 import torch
 from torch.utils.data import DataLoader
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from utils.data_utils import load_seq_label_dataframe, resolve_task_splits, SequenceClassificationDataset
+
+
+def get_default_model_path():
+    local_p = "/nfsd/nannidl/simionricc/models/dnabert2_camp/model"
+    return local_p if os.path.exists(local_p) else "zhihan1996/DNABERT-2-117M"
 
 
 def evaluate_loader(model, loader, is_ce, is_dnabert, is_fulle, device):
@@ -26,10 +34,10 @@ def evaluate_loader(model, loader, is_ce, is_dnabert, is_fulle, device):
                 out = model(batch["input_ids"].to(device), batch["attention_mask"].to(device))
             else:
                 out = model(batch["data"].to(device))
-                if not is_ce:
+                if not is_ce and not is_fulle:
                     out = out.squeeze(-1)
 
-            logits_val = (out[:, 1] - out[:, 0]) if is_ce else out
+            logits_val = (out[:, 1] - out[:, 0]) if (is_ce and not is_fulle) else out
             all_logits.extend(logits_val.cpu().numpy().flatten())
             all_targets.extend(batch["label"].numpy().flatten())
 
@@ -49,6 +57,7 @@ def main():
     parser.add_argument("--task", type=str, required=True, choices=["viral", "ecoli", "enhancer", "anellovirus"])
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C"])
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint (.pt/.pth)")
+    parser.add_argument("--model_name_or_path", default=get_default_model_path())
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
     parser.add_argument("--logits_dir", default="./global_logits")
     parser.add_argument("--test_csv", default=None, help="Optional direct test CSV path")
@@ -66,7 +75,6 @@ def main():
     is_fulle = (args.arch == "fulle")
     tokenizer = None
 
-    # Lazy-loading modulare delle architetture per isolare dipendenze e ambienti
     if args.arch == "genexplorer":
         from models.genexplorer import GenExplorer
         model = GenExplorer(out_features=num_classes, max_len=max(512, seq_len))
@@ -84,25 +92,38 @@ def main():
     elif args.arch == "dnabert2camp":
         from transformers import AutoTokenizer
         from models.dnabert2_camp import DNABERT2CAMP
-        tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
-        model = DNABERT2CAMP(num_classes=num_classes)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+        model = DNABERT2CAMP(model_name_or_path=args.model_name_or_path, num_classes=num_classes)
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt)
         model.to(device).eval()
 
     elif args.arch == "fulle":
-        from models.fulle import FullEBranch, FullEMerger
+        from models.fulle import FullEBranch, FullEMerger, FullE10Ensemble
         ckpt = torch.load(args.checkpoint, map_location=device)
-        b_freq = FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", num_classes=num_classes).to(device)
-        b_pat = FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="max", num_classes=num_classes).to(device)
-        b_lp = FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="lp", num_classes=num_classes).to(device)
-        merger = FullEMerger([b_freq, b_pat, b_lp], num_classes=num_classes).to(device)
 
-        b_freq.load_state_dict(ckpt["branch_freq"])
-        b_pat.load_state_dict(ckpt["branch_pat"])
-        b_lp.load_state_dict(ckpt["branch_lp"])
-        merger.load_state_dict(ckpt["merger_full"])
-        model = merger.eval()
+        branches = {
+            "freq": FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", num_classes=num_classes).to(device),
+            "freq_paper": FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", num_classes=num_classes).to(device),
+            "pat": FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="max", num_classes=num_classes).to(device),
+            "pat_paper": FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="max", num_classes=num_classes).to(device),
+            "lp": FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="lp", num_classes=num_classes).to(device),
+        }
+        for name, b in branches.items():
+            b.load_state_dict(ckpt[f"branch_{name}"])
+
+        mergers = {
+            "merger_fpl": FullEMerger([branches["freq"], branches["pat"], branches["lp"]], num_classes=num_classes).to(device),
+            "merger_fl": FullEMerger([branches["freq"], branches["lp"]], num_classes=num_classes).to(device),
+            "merger_pl": FullEMerger([branches["pat"], branches["lp"]], num_classes=num_classes).to(device),
+            "merger_vm": FullEMerger([branches["freq"], branches["pat"]], num_classes=num_classes).to(device),
+            "merger_vm_paper": FullEMerger([branches["freq_paper"], branches["pat_paper"]], num_classes=num_classes).to(device),
+        }
+        for name, m in mergers.items():
+            m.load_state_dict(ckpt[f"merger_{name}"])
+
+        # Reconstruct full 10-model Sum-Rule Ensemble (Eq. 3[cite: 9])
+        model = FullE10Ensemble(branches, mergers, num_classes=num_classes).to(device).eval()
 
     os.makedirs(args.logits_dir, exist_ok=True)
     prefix_map = {
