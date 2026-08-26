@@ -38,21 +38,21 @@ Each configuration reflects the native loss, optimization, learning rate schedul
 ```text
                  ┌───────────────────────────────────────────────┐
                  │           Evaluation Architectures            │
-                 │   [ ViraExplorer | FullE | Nucleic-Trans. ]   │
+                 │   [ GenExplorer | FullE | Nucleic-Trans. ]   │
                  └───────────────────────┬───────────────────────┘
                                          │
         ┌────────────────────────────────┼────────────────────────────────┐
         ▼                                ▼                                ▼
 ┌──────────────┐                  ┌──────────────┐                  ┌──────────────┐
 │ Config A (C1)│                  │ Config B (C2)│                  │ Config C (C3)│
-│ ViraExplorer │                  │    FullE     │                  │  Nucleic-Tr. │
+│ GenExplorer  │                  │    FullE     │                  │  Nucleic-Tr. │
 │    Native    │                  │    Native    │                  │    Native    │
 └──────────────┘                  └──────────────┘                  └──────────────┘
 ````
 
 ### Configuration Specifications
 
-### 1. Configuration A ($C_1$ – ViraExplorer Strategy)
+### 1. Configuration A ($C_1$ – GenExplorer Strategy)
 
 * **Optimization Goal**: Maximizes class-imbalance resilience and multi-branch feature learning.
 * **Loss Function**: Focal Loss ($\alpha = 0.75, \gamma = 2.0$) with Label Smoothing ($\epsilon = 0.05$).
