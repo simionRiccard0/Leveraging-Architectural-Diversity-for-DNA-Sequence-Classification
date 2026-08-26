@@ -3,7 +3,7 @@
 
 """
 Dedicated fine-tuning pipeline for DNABERT2-CAMP genomic foundation model.
-Fully compliant with 4x3 Cross-Benchmarking (Strategies C1/A, C2/B, C3/C).
+Fully compliant with 4x3 Cross-Benchmarking (Strategies C1/A, C2/B, C3/C) in stable Float32.
 """
 
 import argparse
@@ -15,7 +15,6 @@ from sklearn.metrics import roc_auc_score, average_precision_score, matthews_cor
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
@@ -26,13 +25,17 @@ from utils.data_utils import seed_everything, resolve_task_splits, SequenceClass
 
 
 class BinaryFocalLoss(nn.Module):
-    def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0, smoothing: float = 0.05):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.smoothing = smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+        targets_smooth = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+        bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction="none")
         probs = torch.sigmoid(logits)
         p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
         alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
@@ -95,18 +98,15 @@ def main():
         optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
     elif args.config == "B":
-        num_pos = sum(train_df["label"].values)
-        pos_weight = torch.tensor([(len(train_df) - num_pos) / max(num_pos, 1)], device=device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        criterion = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.Adam(param_groups, eps=1e-8)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, len(tr_loader) * 5), gamma=0.5)
     else:
         criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(param_groups, eps=1e-8)
-        warmup_steps = max(1, int(total_steps * 0.10))
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: (float(s + 1) / float(warmup_steps)) if (s < warmup_steps) else ((float(warmup_steps) / float(s + 1)) ** 0.5))
+        # Per fine-tuning stabile, lr_base coerente con i param_groups
+        optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
 
-    scaler = GradScaler()
     best_auc, patience_cnt = 0.0, 0
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     best_path = os.path.join(args.checkpoint_dir, f"best_dnabert2camp_{args.task}_{args.config}.pt")
@@ -120,17 +120,17 @@ def main():
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
-            y_loss = labels.long() if is_ce else labels.float()
 
-            with autocast():
-                logits = model(input_ids, mask)
-                loss = criterion(logits, y_loss)
+            logits = model(input_ids, mask)
+            
+            if is_ce:
+                loss = criterion(logits, labels.view(-1).long())
+            else:
+                loss = criterion(logits.view(-1), labels.view(-1).float())
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
             total_loss += loss.item() * len(input_ids)
 
@@ -141,13 +141,16 @@ def main():
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 mask = batch["attention_mask"].to(device, non_blocking=True)
                 logits = model(input_ids, mask)
-                probs = F.softmax(logits, dim=1)[:, 1] if is_ce else torch.sigmoid(logits)
+                probs = F.softmax(logits, dim=1)[:, 1] if is_ce else torch.sigmoid(logits.view(-1))
                 preds.extend(probs.cpu().numpy().flatten())
                 targets.extend(batch["label"].numpy().flatten())
 
-        val_auc = roc_auc_score(targets, preds) if len(np.unique(targets)) > 1 else 0.5
-        val_prc = average_precision_score(targets, preds) if len(np.unique(targets)) > 1 else 0.0
-        val_mcc = matthews_corrcoef(targets, (np.array(preds) >= 0.5).astype(int)) if len(np.unique(targets)) > 1 else 0.0
+        preds_arr = np.nan_to_num(np.array(preds), nan=0.5)
+        targets_arr = np.array(targets)
+
+        val_auc = roc_auc_score(targets_arr, preds_arr) if len(np.unique(targets_arr)) > 1 else 0.5
+        val_prc = average_precision_score(targets_arr, preds_arr) if len(np.unique(targets_arr)) > 1 else 0.0
+        val_mcc = matthews_corrcoef(targets_arr, (preds_arr >= 0.5).astype(int)) if len(np.unique(targets_arr)) > 1 else 0.0
         print(f"Epoch {epoch:02d}/{total_epochs:02d} | Train Loss: {total_loss/len(tr_ds):.4f} | Val AUC: {val_auc:.4f} | Val PRC: {val_prc:.4f} | Val MCC: {val_mcc:.4f}")
 
         if val_auc > best_auc:
