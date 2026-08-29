@@ -3,7 +3,6 @@
 
 """
 GenExplorer Full Pipeline: Multi-Scale CNN + Transformer Hybrid.
-Supports Strategies A (C1), B (C2), C (C3 - 2 Logits Cross-Entropy).
 """
 
 import argparse
@@ -17,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -27,9 +27,7 @@ from utils.data_utils import seed_everything, resolve_task_splits, load_seq_labe
 class BinaryFocalLoss(nn.Module):
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0, smoothing: float = 0.05):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.smoothing = smoothing
+        self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         logits = logits.view(-1)
@@ -66,7 +64,7 @@ def evaluate_model(model, dataloader, is_ce, device):
 
 def main():
     parser = argparse.ArgumentParser(description="GenExplorer Complete Training & Evaluation Pipeline")
-    parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C"])
+    parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
@@ -81,9 +79,10 @@ def main():
         "A": {"epochs": 120, "early_stop": True, "patience": 15, "loss": "focal", "opt": "adamw", "sched": "cosine", "drop": 0.25, "trans_drop": 0.1, "out": 1},
         "B": {"epochs": 30, "early_stop": False, "patience": 0, "loss": "bce", "opt": "adam", "sched": "step", "drop": 0.2, "trans_drop": 0.2, "out": 1},
         "C": {"epochs": 60, "early_stop": False, "patience": 0, "loss": "ce", "opt": "adam", "sched": "aiayn", "drop": 0.1, "trans_drop": 0.1, "out": 2},
+        "D": {"epochs": 20, "early_stop": True, "patience": 8, "loss": "ce", "opt": "adamw", "sched": "warmup_cosine", "drop": 0.5, "trans_drop": 0.1, "out": 2},
     }
     cfg = config_map[args.config]
-    is_ce = (args.config == "C")
+    is_ce = (args.config in ["C", "D"])
 
     train_df, val_df, seq_len, cascade_dict = resolve_task_splits(args.task, args.data_folder, args.seed)
     print(f"[i] GenExplorer Pipeline | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | Length: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
@@ -94,25 +93,23 @@ def main():
     tr_loader = DataLoader(tr_ds, batch_size=128, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
 
-    model = GenExplorer(
-        cnn_drop=cfg["drop"],
-        trans_drop=cfg["trans_drop"],
-        out_features=cfg["out"],
-        max_len=max(512, seq_len)
-    ).to(device)
-
+    model = GenExplorer(cnn_drop=cfg["drop"], trans_drop=cfg["trans_drop"], out_features=cfg["out"], max_len=max(512, seq_len)).to(device)
     criterion = BinaryFocalLoss() if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
+    total_steps = len(tr_loader) * cfg["epochs"]
 
     if cfg["opt"] == "adamw":
         transformer_params = list(model.transformer.parameters())
         other_params = list(model.pattern.parameters()) + list(model.frequency.parameters()) + list(model.fc.parameters())
-        optimizer = torch.optim.AdamW([{"params": other_params, "lr": 1e-4}, {"params": transformer_params, "lr": 5e-5}], weight_decay=1e-4)
+        wd = 0.05 if args.config == "D" else 1e-4
+        optimizer = torch.optim.AdamW([{"params": other_params, "lr": 1e-4}, {"params": transformer_params, "lr": 5e-5}], weight_decay=wd)
     else:
         lr_base = 0.001 if args.config == "B" else 1.0
         optimizer = torch.optim.Adam(model.parameters(), lr=lr_base)
 
     if cfg["sched"] == "cosine":
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5))))
+    elif cfg["sched"] == "warmup_cosine":
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
     elif cfg["sched"] == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     else:
@@ -142,13 +139,14 @@ def main():
             out = model(x_b)
             loss = criterion(out, y_b.long() if is_ce else y_b.view(-1).float())
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if args.config == "D" else 1.0)
             optimizer.step()
 
-            if cfg["sched"] == "aiayn":
+            if cfg["sched"] in ["aiayn", "warmup_cosine"]:
                 scheduler.step()
             total_loss += loss.item() * len(x_b)
 
-        if cfg["sched"] != "aiayn":
+        if cfg["sched"] not in ["aiayn", "warmup_cosine"]:
             scheduler.step()
 
         val_auc, val_prc, val_mcc, _ = evaluate_model(model, val_loader, is_ce, device)
@@ -167,7 +165,6 @@ def main():
     print(f"\n[✓] Training complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
 
-    # Cascade Evaluation
     os.makedirs(args.logits_dir, exist_ok=True)
     print("\n--- Running Cascade Evaluation ---")
     for d_name, d_path in cascade_dict.items():

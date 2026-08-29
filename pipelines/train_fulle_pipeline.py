@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-FullE Full Pipeline: 10-Subnetwork Ensemble with Sum-Rule Decision Fusion (Eq. 3).
-Trains 5 Branches + 5 Mergers; exports Sum-Rule ensemble predictions to global_logits.
+FullE Full Pipeline: 10-Subnetwork Ensemble with Sum-Rule Decision Fusion.
 """
 
 import argparse
@@ -17,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -27,9 +27,7 @@ from utils.data_utils import seed_everything, resolve_task_splits, load_seq_labe
 class BinaryFocalLoss(nn.Module):
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0, smoothing: float = 0.05):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.smoothing = smoothing
+        self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         targets_smooth = targets.unsqueeze(1) * (1 - self.smoothing) + 0.5 * self.smoothing
@@ -38,7 +36,7 @@ class BinaryFocalLoss(nn.Module):
 
 
 def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, device, freeze_branches=False):
-    is_ce = (config_name == "C")
+    is_ce = (config_name in ["C", "D"])
     if freeze_branches and isinstance(model, FullEMerger):
         for b in model.branches:
             for p in b.parameters():
@@ -46,15 +44,19 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
 
     criterion = BinaryFocalLoss() if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    total_steps = len(tr_loader) * cfg["epochs"]
 
     if cfg["opt"] == "adamw":
-        optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=1e-4)
+        wd = 0.05 if config_name == "D" else 1e-4
+        optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=wd)
     else:
         lr_base = 0.001 if config_name == "B" else 1.0
         optimizer = torch.optim.Adam(trainable_params, lr=lr_base)
 
     if cfg["sched"] == "cosine":
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5))))
+    elif cfg["sched"] == "warmup_cosine":
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
     elif cfg["sched"] == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     else:
@@ -73,11 +75,12 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
             out = model(x_b)
             loss = criterion(out, y_b.long() if is_ce else y_b.float())
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if config_name == "D" else 1.0)
             optimizer.step()
-            if cfg["sched"] == "aiayn":
+            if cfg["sched"] in ["aiayn", "warmup_cosine"]:
                 scheduler.step()
 
-        if cfg["sched"] != "aiayn":
+        if cfg["sched"] not in ["aiayn", "warmup_cosine"]:
             scheduler.step()
 
         model.eval()
@@ -105,7 +108,7 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
 
 def main():
     parser = argparse.ArgumentParser(description="FullE Complete 10-Subnetwork Training & Cascade Pipeline")
-    parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C"])
+    parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
@@ -120,6 +123,7 @@ def main():
         "A": {"epochs": 120, "early_stop": True, "patience": 15, "loss": "focal", "opt": "adamw", "sched": "cosine", "drop": 0.25, "out": 1},
         "B": {"epochs": 30, "early_stop": False, "patience": 0, "loss": "bce", "opt": "adam", "sched": "step", "drop": 0.2, "out": 1},
         "C": {"epochs": 60, "early_stop": False, "patience": 0, "loss": "ce", "opt": "adam", "sched": "aiayn", "drop": 0.1, "out": 2},
+        "D": {"epochs": 20, "early_stop": True, "patience": 8, "loss": "ce", "opt": "adamw", "sched": "warmup_cosine", "drop": 0.5, "out": 2},
     }
     cfg = config_map[args.config]
 
@@ -132,7 +136,6 @@ def main():
     tr_loader = DataLoader(tr_ds, batch_size=128, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
 
-    # 1. Addestramento dei 5 rami convoluzionali
     branches = {
         "freq": FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
         "freq_paper": FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
@@ -146,7 +149,6 @@ def main():
         b, score = train_single_subnetwork(b, tr_loader, val_loader, cfg, args.config, device)
         print(f" -> Branch '{name}' Best Val AUC: {score:.4f}")
 
-    # 2. Addestramento dei 5 merger multi-ramo
     mergers = {
         "merger_fpl": FullEMerger([branches["freq"], branches["pat"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
         "merger_fl": FullEMerger([branches["freq"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
@@ -160,7 +162,6 @@ def main():
         m, score = train_single_subnetwork(m, tr_loader, val_loader, cfg, args.config, device, freeze_branches=True)
         print(f" -> Merger '{name}' Best Val AUC: {score:.4f}")
 
-    # 3. Costruzione Ensemble Sum-Rule a 10 Modelli (Eq. 3)
     ensemble = FullE10Ensemble(branches, mergers, num_classes=cfg["out"]).to(device).eval()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -170,7 +171,6 @@ def main():
     torch.save(save_dict, ckpt_path)
     print(f"\n[✓] Full 10-Subnetwork Checkpoint saved: {ckpt_path}")
 
-    # 4. Cascade Evaluation
     os.makedirs(args.logits_dir, exist_ok=True)
     print("\n--- Running Sum-Rule Cascade Evaluation ---")
     for d_name, d_path in cascade_dict.items():
