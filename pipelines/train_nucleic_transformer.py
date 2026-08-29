@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Dedicated training pipeline for Nucleic Transformer (He et al.)[cite: 8].
-Fully aligned with 4x4 Cross-Benchmarking (Strategies A, B, C, D).
+Standalone training pipeline for Nucleic Transformer.
 """
 
 import argparse
@@ -17,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -39,6 +37,15 @@ class BinaryFocalLoss(nn.Module):
         p_t = targets * probs + (1 - targets) * (1 - probs)
         alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
         return (alpha_t * ((1 - p_t) ** self.gamma) * bce).mean()
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def main():
@@ -160,7 +167,7 @@ def main():
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    print(f"[✓] Checkpoint saved: {best_path} (Best Val AUC: {best_auc:.4f})")
+    print(f"Checkpoint saved: {best_path} (Best Val AUC: {best_auc:.4f})")
 
 
 if __name__ == "__main__":

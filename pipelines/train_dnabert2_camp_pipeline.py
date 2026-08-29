@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-DNABERT2-CAMP Full Pipeline: Pre-trained Genomic Foundation Model + Motif Refinement[cite: 2].
-Supports Strategies A (C1), B (C2), C (C3), D (C4 - Native DNABERT2 AdamW + Cosine Warmup)[cite: 2].
+Integrated training and cascade evaluation pipeline for DNABERT2-CAMP.
 """
 
 import argparse
@@ -70,7 +69,7 @@ def evaluate_model(model, dataloader, is_ce, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DNABERT2-CAMP Fine-tuning Pipeline")
+    parser = argparse.ArgumentParser(description="DNABERT2-CAMP Fine-tuning & Cascade Pipeline")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
@@ -167,7 +166,7 @@ def main():
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    print(f"\n[✓] Training complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
+    print(f"\nTraining complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
 
     os.makedirs(args.logits_dir, exist_ok=True)

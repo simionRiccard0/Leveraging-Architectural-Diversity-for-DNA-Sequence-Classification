@@ -2,19 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-Dedicated training script for GenExplorer.
+Standalone training script for GenExplorer.
+Supports Configurations A (C1), B (C2), C (C3), and D (C4).
 """
 
 import argparse
 import math
 import os
+import sys
 import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.genexplorer import GenExplorer
 from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset
@@ -26,9 +29,23 @@ class BinaryFocalLoss(nn.Module):
         self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        targets_smooth = targets.unsqueeze(1) * (1 - self.smoothing) + 0.5 * self.smoothing
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+        targets_smooth = targets * (1 - self.smoothing) + 0.5 * self.smoothing
         bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction="none")
-        return (self.alpha * (1 - torch.exp(-bce)) ** self.gamma * bce).mean()
+        probs = torch.sigmoid(logits)
+        p_t = targets * probs + (1 - targets) * (1 - probs)
+        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+        return (alpha_t * ((1 - p_t) ** self.gamma) * bce).mean()
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def main():
@@ -50,6 +67,7 @@ def main():
         "D": {"epochs": 20, "early_stop": True, "patience": 8, "batch_size": 128, "loss": "ce", "opt": "adamw", "sched": "warmup_cosine", "drop": 0.5, "out": 2},
     }
     cfg = config_map[args.config]
+    is_ce = (args.config in ["C", "D"])
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
     print(f"[i] Training GenExplorer | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | Input: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
@@ -99,10 +117,10 @@ def main():
         model.train()
         total_loss = 0.0
         for batch in tr_loader:
-            x_b, y_b = batch["data"].to(device), batch["label"].to(device)
-            optimizer.zero_grad()
+            x_b, y_b = batch["data"].to(device, non_blocking=True), batch["label"].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
             out = model(x_b)
-            loss = criterion(out, y_b.long() if cfg["loss"] == "ce" else (y_b.unsqueeze(1) if cfg["loss"] == "bce" else y_b))
+            loss = criterion(out, y_b.view(-1).long() if is_ce else y_b.view(-1).float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if args.config == "D" else 1.0)
             optimizer.step()
@@ -117,8 +135,8 @@ def main():
         preds, targets = [], []
         with torch.no_grad():
             for batch in val_loader:
-                out = model(batch["data"].to(device))
-                probs = F.softmax(out, dim=1)[:, 1] if cfg["loss"] == "ce" else torch.sigmoid(out)
+                out = model(batch["data"].to(device, non_blocking=True))
+                probs = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out.view(-1))
                 preds.extend(probs.cpu().numpy().flatten())
                 targets.extend(batch["label"].numpy().flatten())
 

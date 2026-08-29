@@ -3,8 +3,9 @@
 
 """
 Universal Standalone Inference Script:
-Loads trained checkpoints and extracts logit files for all test benchmarks.
-Supports: GenExplorer, Nucleic Transformer, DNABERT2-CAMP, and FullE 10-Model Sum-Rule Ensemble (Eq. 3).
+Extracts logit files across all benchmark test sets.
+Supports: GenExplorer, Nucleic Transformer, DNABERT2-CAMP, and FullE 10-Model Sum-Rule Ensemble.
+Fully aligned with the 4x4 Cross-Benchmarking framework (Strategies A, B, C, D).
 """
 
 import argparse
@@ -31,9 +32,9 @@ def evaluate_loader(model, loader, is_ce, is_dnabert, is_fulle, device):
     with torch.no_grad():
         for batch in loader:
             if is_dnabert:
-                out = model(batch["input_ids"].to(device), batch["attention_mask"].to(device))
+                out = model(batch["input_ids"].to(device, non_blocking=True), batch["attention_mask"].to(device, non_blocking=True))
             else:
-                out = model(batch["data"].to(device))
+                out = model(batch["data"].to(device, non_blocking=True))
                 if not is_ce and not is_fulle:
                     out = out.squeeze(-1)
 
@@ -41,8 +42,8 @@ def evaluate_loader(model, loader, is_ce, is_dnabert, is_fulle, device):
             all_logits.extend(logits_val.cpu().numpy().flatten())
             all_targets.extend(batch["label"].numpy().flatten())
 
-    logits_arr = np.array(all_logits)
-    targets_arr = np.array(all_targets)
+    logits_arr = np.nan_to_num(np.array(all_logits), nan=0.0)
+    targets_arr = np.array(all_targets).astype(int)
     probs_arr = 1.0 / (1.0 + np.exp(-logits_arr))
 
     auc = roc_auc_score(targets_arr, probs_arr) if len(np.unique(targets_arr)) > 1 else 0.5
@@ -55,7 +56,7 @@ def main():
     parser = argparse.ArgumentParser(description="Universal Model Evaluation & Logits Extraction")
     parser.add_argument("--arch", type=str, required=True, choices=["genexplorer", "nucleictransformer", "dnabert2camp", "fulle"])
     parser.add_argument("--task", type=str, required=True, choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C"])
+    parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint (.pt/.pth)")
     parser.add_argument("--model_name_or_path", default=get_default_model_path())
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
@@ -69,7 +70,7 @@ def main():
     if args.test_csv:
         cascade_dict = {"custom_test": args.test_csv}
 
-    is_ce = (args.config == "C")
+    is_ce = (args.config in ["C", "D"])
     num_classes = 2 if is_ce else 1
     is_dnabert = (args.arch == "dnabert2camp")
     is_fulle = (args.arch == "fulle")
@@ -110,7 +111,12 @@ def main():
             "lp": FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="lp", num_classes=num_classes).to(device),
         }
         for name, b in branches.items():
-            b.load_state_dict(ckpt[f"branch_{name}"])
+            if "branches" in ckpt and name in ckpt["branches"]:
+                b.load_state_dict(ckpt["branches"][name])
+            elif f"branch_{name}" in ckpt:
+                b.load_state_dict(ckpt[f"branch_{name}"])
+            else:
+                b.load_state_dict(ckpt[name])
 
         mergers = {
             "merger_fpl": FullEMerger([branches["freq"], branches["pat"], branches["lp"]], num_classes=num_classes).to(device),
@@ -120,9 +126,13 @@ def main():
             "merger_vm_paper": FullEMerger([branches["freq_paper"], branches["pat_paper"]], num_classes=num_classes).to(device),
         }
         for name, m in mergers.items():
-            m.load_state_dict(ckpt[f"merger_{name}"])
+            if "mergers" in ckpt and name in ckpt["mergers"]:
+                m.load_state_dict(ckpt["mergers"][name])
+            elif f"merger_{name}" in ckpt:
+                m.load_state_dict(ckpt[f"merger_{name}"])
+            else:
+                m.load_state_dict(ckpt[name])
 
-        # Reconstruct full 10-model Sum-Rule Ensemble (Eq. 3[cite: 9])
         model = FullE10Ensemble(branches, mergers, num_classes=num_classes).to(device).eval()
 
     os.makedirs(args.logits_dir, exist_ok=True)

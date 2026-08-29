@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-GenExplorer Full Pipeline: Multi-Scale CNN + Transformer Hybrid.
+Integrated training and cascade evaluation pipeline for GenExplorer.
 """
 
 import argparse
@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -38,6 +37,15 @@ class BinaryFocalLoss(nn.Module):
         p_t = targets * probs + (1 - targets) * (1 - probs)
         alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
         return (alpha_t * ((1 - p_t) ** self.gamma) * bce).mean()
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def evaluate_model(model, dataloader, is_ce, device):
@@ -63,7 +71,7 @@ def evaluate_model(model, dataloader, is_ce, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GenExplorer Complete Training & Evaluation Pipeline")
+    parser = argparse.ArgumentParser(description="GenExplorer Training & Cascade Pipeline")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
@@ -98,10 +106,10 @@ def main():
     total_steps = len(tr_loader) * cfg["epochs"]
 
     if cfg["opt"] == "adamw":
-        transformer_params = list(model.transformer.parameters())
-        other_params = list(model.pattern.parameters()) + list(model.frequency.parameters()) + list(model.fc.parameters())
+        trans_p = list(model.transformer.parameters())
+        other_p = list(model.pattern.parameters()) + list(model.frequency.parameters()) + list(model.fc.parameters())
         wd = 0.05 if args.config == "D" else 1e-4
-        optimizer = torch.optim.AdamW([{"params": other_params, "lr": 1e-4}, {"params": transformer_params, "lr": 5e-5}], weight_decay=wd)
+        optimizer = torch.optim.AdamW([{"params": other_p, "lr": 1e-4}, {"params": trans_p, "lr": 5e-5}], weight_decay=wd)
     else:
         lr_base = 0.001 if args.config == "B" else 1.0
         optimizer = torch.optim.Adam(model.parameters(), lr=lr_base)
@@ -137,7 +145,7 @@ def main():
             y_b = batch["label"].to(device, non_blocking=True)
 
             out = model(x_b)
-            loss = criterion(out, y_b.long() if is_ce else y_b.view(-1).float())
+            loss = criterion(out, y_b.view(-1).long() if is_ce else y_b.view(-1).float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if args.config == "D" else 1.0)
             optimizer.step()
@@ -162,7 +170,7 @@ def main():
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    print(f"\n[✓] Training complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
+    print(f"\nTraining complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
 
     os.makedirs(args.logits_dir, exist_ok=True)

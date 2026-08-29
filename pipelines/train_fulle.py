@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-FullE Decoupled Training Pipeline: 10-Subnetwork Ensemble.
+Subnetwork training pipeline for FullE (5 branches + 5 mergers).
 """
 
 import argparse
@@ -10,13 +10,11 @@ import math
 import os
 import sys
 import numpy as np
-import pandas as pd
 from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -33,6 +31,15 @@ class BinaryFocalLoss(nn.Module):
         targets_smooth = targets.unsqueeze(1) * (1 - self.smoothing) + 0.5 * self.smoothing
         bce = F.binary_cross_entropy_with_logits(logits.unsqueeze(1), targets_smooth, reduction="none")
         return (self.alpha * (1 - torch.exp(-bce)) ** self.gamma * bce).mean()
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, device, freeze_branches=False):
@@ -73,7 +80,7 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
 
             optimizer.zero_grad(set_to_none=True)
             out = model(x_b)
-            loss = criterion(out, y_b.long() if is_ce else y_b.float())
+            loss = criterion(out, y_b.view(-1).long() if is_ce else y_b.view(-1).float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if config_name == "D" else 1.0)
             optimizer.step()
@@ -88,7 +95,7 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
         with torch.no_grad():
             for batch in val_loader:
                 out = model(batch["data"].to(device, non_blocking=True))
-                probs = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out)
+                probs = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out.view(-1))
                 preds.extend(probs.cpu().numpy().flatten())
                 targets.extend(batch["label"].numpy().flatten())
 
@@ -171,7 +178,7 @@ def main():
         "mergers": {k: v.state_dict() for k, v in mergers.items()}
     }
     torch.save(save_dict, ckpt_path)
-    print(f"\nCheckpoint salvato con successo: {ckpt_path}")
+    print(f"\nCheckpoint saved: {ckpt_path}")
 
 
 if __name__ == "__main__":

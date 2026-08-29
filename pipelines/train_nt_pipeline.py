@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Nucleic Transformer Full Pipeline: 1D Conv Multi-Kmer Tokenizer + Self-Attention.
-Supports Strategies A (C1), B (C2), C (C3), D (C4 - DNABERT2 AdamW + Cosine Warmup)[cite: 7].
+Integrated training and cascade evaluation pipeline for Nucleic Transformer.
 """
 
 import argparse
@@ -17,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -39,6 +37,15 @@ class BinaryFocalLoss(nn.Module):
         p_t = targets * probs + (1 - targets) * (1 - probs)
         alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
         return (alpha_t * ((1 - p_t) ** self.gamma) * bce).mean()
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def evaluate_model(model, dataloader, is_ce, device):
@@ -64,7 +71,7 @@ def evaluate_model(model, dataloader, is_ce, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Nucleic Transformer Complete Training Pipeline")
+    parser = argparse.ArgumentParser(description="Nucleic Transformer Training & Cascade Pipeline")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
@@ -165,7 +172,7 @@ def main():
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    print(f"\n[✓] Training complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
+    print(f"\nTraining complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
 
     os.makedirs(args.logits_dir, exist_ok=True)

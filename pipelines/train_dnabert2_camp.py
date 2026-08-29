@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Dedicated fine-tuning pipeline for DNABERT2-CAMP genomic foundation model[cite: 1].
-Fully compliant with 4x4 Cross-Benchmarking (Strategies A, B, C, D) in stable Float32[cite: 1].
+Standalone fine-tuning pipeline for DNABERT2-CAMP.
 """
 
 import argparse
@@ -160,7 +159,7 @@ def main():
                 print(f"Early stopping triggered at epoch {epoch}.")
                 break
 
-    print(f"[✓] Checkpoint saved successfully: {best_path} (Best Val AUC: {best_auc:.4f})")
+    print(f"Checkpoint saved successfully: {best_path} (Best Val AUC: {best_auc:.4f})")
 
 
 if __name__ == "__main__":
