@@ -2,7 +2,7 @@
 
 
 This repository implements a multi-domain benchmark to evaluate how diverse deep learning paradigms generalize across heterogeneous genomic sequence classification tasks directly from raw nucleotide sequences without manual feature extraction.
-The repository provides a dual execution framework: a decoupled workflow (strictly separating training/checkpointing from standalone inference) alongside monolithic end-to-end pipelines, ensuring complete experimental flexibility and post-hoc logit analysis across biological benchmarks.
+The repository provides a dual execution framework: a decoupled workflow (strictly separating training/checkpointing from standalone inference) alongside end-to-end pipelines, ensuring complete experimental flexibility and post-hoc logit analysis across biological benchmarks.
 
 ---
 ## Research Objective
@@ -29,25 +29,23 @@ We benchmark four distinct architectural paradigms, exploring the trade-offs bet
 |**Genomic Foundation Model** | **DNABERT2-CAMP** | Leverages the pre-trained DNABERT-2 (117M) transformer backbone fine-tuned alongside a CAMP (Convolutional Attention Motif Profiler) module—a 4-layer 1D CNN cascade coupled with Multi-Head Self-Attention for localized motif refinement. |
 ---
 
-## Experimental Strategy: Configuration Cross-Benchmarking
+## Experimental Strategy: $4 \times 4$ Symmetrical Cross-Benchmarking
 
-To evaluate both **native optimization** and **cross-paradigm adaptability**, each architecture is systematically trained and evaluated under **three distinct configuration strategies ($C_1, C_2, C_3$)**.
-
-Each configuration reflects the native loss, optimization, learning rate schedule, and data augmentation strategy of one of the baseline models:
+To evaluate both **native optimization** and **cross-paradigm adaptability**, each architecture is systematically trained and evaluated across **four distinct configuration strategies ($C_1, C_2, C_3, C_4$)**, forming a complete $4 \times 4$ evaluation matrix.
 
 ```text
-                 ┌───────────────────────────────────────────────┐
-                 │           Evaluation Architectures            │
-                 │   [ GenExplorer | FullE | Nucleic-Trans. ]   │
-                 └───────────────────────┬───────────────────────┘
-                                         │
-        ┌────────────────────────────────┼────────────────────────────────┐
-        ▼                                ▼                                ▼
-┌──────────────┐                  ┌──────────────┐                  ┌──────────────┐
-│ Config A (C1)│                  │ Config B (C2)│                  │ Config C (C3)│
-│ GenExplorer  │                  │    FullE     │                  │  Nucleic-Tr. │
-│    Native    │                  │    Native    │                  │    Native    │
-└──────────────┘                  └──────────────┘                  └──────────────┘
+                 ┌──────────────────────────────────────────────────────────┐
+                 │                 Evaluation Architectures                 │
+                 │ [ GenExplorer | FullE | Nucleic-Trans. | DNABERT2-CAMP ] │
+                 └────────────────────────────┬─────────────────────────────┘
+                                              │
+        ┌─────────────────────┬───────────────┴───────────────┬─────────────────────┐
+        ▼                     ▼                               ▼                     ▼
+┌──────────────┐      ┌──────────────┐                ┌──────────────┐      ┌──────────────┐
+│ Config A (C1)│      │ Config B (C2)│                │ Config C (C3)│      │ Config D (C4)│
+│ GenExplorer  │      │    FullE     │                │ Nucleic-Tr.  │      │  DNABERT-2   │
+│    Native    │      │    Native    │                │    Native    │      │    Native    │
+└──────────────┘      └──────────────┘                └──────────────┘      └──────────────┘
 ````
 
 ### Configuration Specifications
@@ -79,6 +77,15 @@ Each configuration reflects the native loss, optimization, learning rate schedul
 * **Optimizer & Schedule**: Adam optimizer with Noam (AIAYN) inverse-square-root learning rate schedule and warmup steps.
 * **Data Augmentation**: Stochastic mutation augmentation ($K = \min(40, \lfloor 0.13 \cdot L \rfloor)$ nucleotide substitutions per sequence).
 * **Training Protocol**: Fixed 60 epochs without early stopping.
+* 
+### 4. Configuration D ($C_4$ – DNABERT-2 Strategy)
+
+* **Optimization Goal**: Foundation model fine-tuning with aggressive weight regularization.
+* **Loss Function**: Cross-Entropy/ BCE Loss.
+* **Optimizer & Schedule**:  AdamW ($lr = 5\times 10^{-5}$, weight decay $= 0.05$, gradient clipping at $0.8$) with a 10% linear warmup and Cosine schedule.
+* **Data Augmentation**:  Stochastic Reverse Complement ($p=0.5$) and random positional sequence shifts within $\pm 5\text{ bp}$.
+* **Training Protocol**:  Maximum 20 epochs with Early Stopping (patience = 8) and elevated dropout ($p=0.5$).
+
 
 ---
 
@@ -111,9 +118,10 @@ Models trained under each configuration are evaluated across 5 biological benchm
 ## Dual Execution Framework
 
 The repository supports two workflows depending on experimental and computational requirements.
-Both workflows export raw logits to
+Both modes save prediction outputs as raw logit files:
 ```
-global_logits/
+Decoupled Mode: exports to global_logits/
+Pipeline Mode: exports to global_logits_monolithic/
 ```
 using the unified naming convention:
 ```
@@ -263,7 +271,10 @@ Consequently, the benchmark supports two complementary analyses:
 * **Cross-architecture comparison**: Evaluates different architectures trained under the same optimization strategy.
 
 This design enables a fair assessment of both architectural inductive biases and optimization strategies.
-
+To compute the comprehensive $4 \times 4$ metric tables (AUROC, AUPRC, MCC, Balanced Accuracy), noise degradation summaries, and inter-architectural ensemble voting, run:
+```bash
+python compute_metrics.py --dir_mod global_logits
+```
 ---
 Saving raw logits rather than only final metrics allows:
 
