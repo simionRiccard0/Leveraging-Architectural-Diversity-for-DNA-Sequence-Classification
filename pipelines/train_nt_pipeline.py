@@ -3,6 +3,7 @@
 
 """
 Integrated training and cascade evaluation pipeline for Nucleic Transformer.
+Fixed: Dynamic Class Weighting & Correct Noam (AIAYN) lr_scale.
 """
 
 import argparse
@@ -62,7 +63,7 @@ def evaluate_model(model, dataloader, is_ce, device):
 
     logits_arr = np.nan_to_num(np.array(all_logits), nan=0.0)
     targets_arr = np.array(all_targets).astype(int)
-    probs_arr = 1.0 / (1.0 + np.exp(-logits_arr))
+    probs_arr = 1.0 / (1.0 + np.exp(-np.clip(logits_arr, -50.0, 50.0)))
 
     auc = roc_auc_score(targets_arr, probs_arr) if len(np.unique(targets_arr)) > 1 else 0.5
     prc = average_precision_score(targets_arr, probs_arr) if len(np.unique(targets_arr)) > 1 else 0.0
@@ -96,6 +97,11 @@ def main():
     train_df, val_df, seq_len, cascade_dict = resolve_task_splits(args.task, args.data_folder, args.seed)
     print(f"[i] Nucleic Transformer Pipeline | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | Length: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
 
+    # Calcolo pesi di bilanciamento per dataset imbilanciati (es. ViraMiner)
+    num_pos = float(train_df["label"].sum())
+    num_neg = float(len(train_df) - num_pos)
+    pos_weight_ratio = num_neg / max(1.0, num_pos)
+
     tr_ds = SequenceClassificationDataset(train_df["sequence"].tolist(), train_df["label"].tolist(), "nucleictransformer", seq_len, args.config, is_train=True)
     val_ds = SequenceClassificationDataset(val_df["sequence"].tolist(), val_df["label"].tolist(), "nucleictransformer", seq_len, args.config, is_train=False)
 
@@ -115,7 +121,17 @@ def main():
         max_len=max(2000, seq_len + 100)
     ).to(device)
 
-    criterion = BinaryFocalLoss() if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
+    # Definizione Loss pesata
+    if cfg["loss"] == "focal":
+        alpha = min(0.95, max(0.5, pos_weight_ratio / (pos_weight_ratio + 1.0)))
+        criterion = BinaryFocalLoss(alpha=alpha, gamma=2.0)
+    elif cfg["loss"] == "bce":
+        pos_weight_t = torch.tensor([pos_weight_ratio], device=device).float()
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
+    else:
+        class_weights = torch.tensor([1.0, pos_weight_ratio], device=device).float()
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
     total_steps = len(tr_loader) * cfg["epochs"]
 
     if cfg["opt"] == "adamw":
@@ -125,14 +141,25 @@ def main():
         lr_base = 0.001 if args.config == "B" else 1.0
         optimizer = torch.optim.Adam(model.parameters(), lr=lr_base)
 
+    # Scheduler con Noam scaling corretto
     if cfg["sched"] == "cosine":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5))))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5)))
+        )
     elif cfg["sched"] == "warmup_cosine":
-        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps
+        )
     elif cfg["sched"] == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     else:
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: (512**-0.5) * min(max(1, s)**-0.5, max(1, s) * (4000**-1.5)))
+        d_model = 512
+        warmup_steps = 3200
+        lr_scale = 0.1
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lambda s: lr_scale * (d_model ** -0.5) * min(max(1, s) ** -0.5, max(1, s) * (warmup_steps ** -1.5))
+        )
 
     best_auc, patience_cnt = 0.0, 0
     os.makedirs(args.checkpoint_dir, exist_ok=True)
