@@ -4,7 +4,6 @@
 """
 Shared data utilities
 """
-
 import os
 import glob
 import math
@@ -95,7 +94,6 @@ def resolve_task_splits(task: str, data_folder: str, seed: int = 2020) -> Tuple[
         if test_vm:
             cascade_test_paths["test_VM"] = test_vm
 
-        # Scan 15 synthetic noise sets (DS-SIM)[cite: 1, 8]
         sim_dir = find_file_scoped(data_folder, ["SIM", ""], ["SIM"]) or os.path.join(data_folder, "SIM")
         if os.path.exists(sim_dir) and os.path.isdir(sim_dir):
             for sf in sorted(glob.glob(os.path.join(sim_dir, "**", "*.csv"), recursive=True)):
@@ -181,7 +179,7 @@ def mutate_sequence(dna_seq: str) -> str:
 
 
 class SequenceClassificationDataset(Dataset):
-    """Generic dataset providing 4D one-hot, 5D one-hot, integer-tokens, or tokenizer embeddings[cite: 7, 8]."""
+    """Generic dataset providing 4D one-hot, 5D one-hot, integer-tokens, or tokenizer embeddings."""
     def __init__(self, sequences: List[str], labels: List[float], arch: str, target_len: int, config: str, is_train: bool, tokenizer=None):
         self.sequences = sequences
         self.labels = labels
@@ -203,7 +201,10 @@ class SequenceClassificationDataset(Dataset):
                     seq = reverse_complement(seq)
                 seq = positional_shift(seq, max_shift=5)
             elif self.config == "C":
-                seq = mutate_sequence(seq)
+                # Mantenuto per GenExplorer, DNABERT-2 e Fulle
+                # Escluso per Nucleic Transformer (esegue la mutazione stocastica nel training loop come da paper)
+                if self.arch != "nucleictransformer":
+                    seq = mutate_sequence(seq)
 
         y = float(self.labels[idx])
 
@@ -215,7 +216,7 @@ class SequenceClassificationDataset(Dataset):
             ids = [NUC_TO_ID.get(b, 0) for b in seq[:self.target_len]]
             while len(ids) < self.target_len:
                 ids.append(0)
-            target_tensor = torch.tensor(int(y), dtype=torch.long) if self.config == "C" else torch.tensor(y, dtype=torch.float32)
+            target_tensor = torch.tensor(int(y), dtype=torch.long) if self.config in ["C", "D"] else torch.tensor(y, dtype=torch.float32)
             return {"data": torch.tensor(ids, dtype=torch.long), "label": target_tensor}
 
         elif self.arch == "fulle":
@@ -228,5 +229,5 @@ class SequenceClassificationDataset(Dataset):
             enc = [MAPPING_4D.get(b, [0,0,0,0]) for b in seq[:self.target_len]]
             while len(enc) < self.target_len:
                 enc.append([0,0,0,0])
-            target_tensor = torch.tensor(int(y), dtype=torch.long) if self.config == "C" else torch.tensor(y, dtype=torch.float32)
+            target_tensor = torch.tensor(int(y), dtype=torch.long) if self.config in ["C", "D"] else torch.tensor(y, dtype=torch.float32)
             return {"data": torch.tensor(enc, dtype=torch.float32), "label": target_tensor}

@@ -1,5 +1,8 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Nucleic Transformer: DNA Sequence Classification with 1D Convolutional k-mer Tokenization and Self-Attention (He et al.)[cite: 9].
+Nucleic Transformer (Yin et al.) 
 """
 
 import math
@@ -28,44 +31,35 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class MultiKmerTokenizer(nn.Module):
+class K_mer_aggregate(nn.Module):
     """
-    1D Convolutional k-mer Tokenizer aggregating multi-scale k-mer representations[cite: 9].
-    Ensures strict length alignment (L) across all kernel sizes (k in [2, 3, 4, 5, 6])[cite: 9].
+    K-mer Aggregator originale (Yin et al.):
+    applica Conv1d con padding=0 per ogni k-mer (out_channels = ninp)
+    e concatena lungo l'asse temporale della sequenza.
     """
-    def __init__(self, ninp: int = 512, kmers: list = None):
+    def __init__(self, kmers: list, ninp: int = 512):
         super().__init__()
-        if kmers is None:
-            kmers = [2, 3, 4, 5, 6]
         self.kmers = kmers
-        self.num_kmers = len(kmers)
-        
-        split_size = ninp // self.num_kmers
-        remainder = ninp % self.num_kmers
-        self.out_channels = [split_size + (1 if i < remainder else 0) for i in range(self.num_kmers)]
-
         self.convs = nn.ModuleList([
-            nn.Conv1d(ninp, self.out_channels[i], kernel_size=k, padding="same")
-            for i, k in enumerate(self.kmers)
+            nn.Conv1d(ninp, ninp, kernel_size=k, padding=0)
+            for k in kmers
         ])
         self.norm = nn.LayerNorm(ninp)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, L, ninp] -> permute for Conv1D: [B, ninp, L]
-        L = x.size(1)
+        # x: [B, L, ninp] -> permute per Conv1D: [B, ninp, L]
         x_conv = x.permute(0, 2, 1)
         
         outputs = []
         for conv in self.convs:
-            out = conv(x_conv)
-            # Garantisce la dimensione temporale identica L per qualsiasi parità di k
-            if out.size(2) != L:
-                out = out[:, :, :L]
-            outputs.append(out)
-            
-        fused = torch.cat(outputs, dim=1)  # [B, ninp, L]
-        fused = fused.permute(0, 2, 1)     # [B, L, ninp]
-        return self.norm(F.gelu(fused))
+            # conv(x_conv) shape: [B, ninp, L - k + 1]
+            outputs.append(conv(x_conv))
+        
+        # Concatena lungo la dimensione della sequenza (dim=2):
+        # L_tot = sum(L - k + 1). Con L=300 e k=[2,3,4,5,6] -> 299+298+297+296+295 = 1485 token
+        fused = torch.cat(outputs, dim=2)  # [B, ninp, L_tot]
+        fused = fused.permute(0, 2, 1)     # [B, L_tot, ninp]
+        return self.norm(F.relu(fused))
 
 
 class NucleicTransformer(nn.Module):
@@ -87,23 +81,25 @@ class NucleicTransformer(nn.Module):
         self.ninp = ninp
         self.kmer_aggregation = kmer_aggregation
 
-        self.embedding = nn.Embedding(ntoken + 1, ninp, padding_idx=0)
-        
-        if self.kmer_aggregation:
-            self.kmer_tokenizer = MultiKmerTokenizer(ninp=ninp, kmers=kmers if kmers is not None else [2, 3, 4, 5, 6])
-        else:
-            self.kmer_tokenizer = nn.Identity()
-
+        # ntoken=4 senza padding_idx: Adenina (indice 0) sempre attiva e allenabile
+        self.embedding = nn.Embedding(ntoken, ninp)
         self.pos_encoder = PositionalEncoding(ninp, max_len=max_len, dropout=dropout)
 
+        if self.kmer_aggregation:
+            self.k_mer_aggregate = K_mer_aggregate(
+                kmers=kmers if kmers is not None else [2, 3, 4, 5, 6],
+                ninp=ninp
+            )
+
+        # Post-LN (norm_first=False) e ReLU coerenti con lo scheduler AIAYN Noam
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=ninp,
             nhead=nhead,
             dim_feedforward=nhid,
             dropout=dropout,
-            activation="gelu",
+            activation="relu",
             batch_first=True,
-            norm_first=True
+            norm_first=False
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
         self.norm = nn.LayerNorm(ninp)
@@ -111,17 +107,21 @@ class NucleicTransformer(nn.Module):
 
     def forward(self, src: torch.Tensor) -> torch.Tensor:
         # src: [B, L]
-        emb = self.embedding(src) * math.sqrt(self.ninp)  # [B, L, ninp]
+        emb = self.embedding(src)       # [B, L, ninp]
         
+        # 1. Positional Encoding applicato sui nucleotidi (come da paper)
+        emb = self.pos_encoder(emb)     # [B, L, ninp]
+
+        # 2. Aggregazione multi-k-mer (espande a L_tot token da 512 feature ciascuno)
         if self.kmer_aggregation:
-            emb = self.kmer_tokenizer(emb)
-            
-        emb = self.pos_encoder(emb)
-        output = self.transformer_encoder(emb)
+            emb = self.k_mer_aggregate(emb)  # [B, L_tot, ninp]
+
+        # 3. Transformer Encoder con Self-Attention globale su tutti i k-mer
+        output = self.transformer_encoder(emb)  # [B, L_tot, ninp]
         output = self.norm(output)
-        
-        # Global Mean Pooling (Eq. 6 del paper)[cite: 9]
-        pooled = torch.mean(output, dim=1)
-        logits = self.decoder(pooled)
-        
+
+        # 4. Global Mean Pooling (Eq. 6 del paper) e classificazione finale
+        pooled = torch.mean(output, dim=1)      # [B, ninp]
+        logits = self.decoder(pooled)           # [B, nclass]
+
         return logits.squeeze(-1) if self.nclass == 1 else logits
