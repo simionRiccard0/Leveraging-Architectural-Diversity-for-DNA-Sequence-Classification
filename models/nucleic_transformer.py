@@ -2,7 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Nucleic Transformer (Yin et al.) 
+Nucleic Transformer (Yin et al.) - Exact Paper Architecture with GeM Pooling.
+Features:
+- K-mer aggregation with padding=0 concatenated along the sequence length axis (L_tot=1485).
+- Positional Encoding applied on nucleotide embeddings before k-mer aggregation.
+- Post-LN (norm_first=False) and standard ReLU activations.
+- Embedding without padding_idx to ensure full Adenine gradient updates.
+- Generalized Mean Pooling (GeM, p=3) matching Network.py (replaces plain torch.mean).
 """
 
 import math
@@ -49,17 +55,32 @@ class K_mer_aggregate(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, L, ninp] -> permute per Conv1D: [B, ninp, L]
         x_conv = x.permute(0, 2, 1)
-        
         outputs = []
         for conv in self.convs:
-            # conv(x_conv) shape: [B, ninp, L - k + 1]
             outputs.append(conv(x_conv))
         
-        # Concatena lungo la dimensione della sequenza (dim=2):
-        # L_tot = sum(L - k + 1). Con L=300 e k=[2,3,4,5,6] -> 299+298+297+296+295 = 1485 token
+        # Concatena lungo la dimensione della sequenza (dim=2): L_tot = sum(L - k + 1)
         fused = torch.cat(outputs, dim=2)  # [B, ninp, L_tot]
         fused = fused.permute(0, 2, 1)     # [B, L_tot, ninp]
         return self.norm(F.relu(fused))
+
+
+class GeM(nn.Module):
+    """
+    Generalized Mean Pooling (GeM) da Network.py (Yin et al.):
+    f(x) = ( 1/L * sum( clamp(x, min=eps)^p ) )^(1/p)
+    Preserva i motivi locali rari evitando la cancellazione da media globale su L=1485.
+    """
+    def __init__(self, p: float = 3.0, eps: float = 1e-6):
+        super().__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, ninp, L]
+        x_clamped = x.clamp(min=self.eps).pow(self.p)
+        pooled = F.adaptive_avg_pool1d(x_clamped, 1).pow(1.0 / self.p)
+        return pooled.squeeze(-1)  # [B, ninp]
 
 
 class NucleicTransformer(nn.Module):
@@ -81,7 +102,7 @@ class NucleicTransformer(nn.Module):
         self.ninp = ninp
         self.kmer_aggregation = kmer_aggregation
 
-        # ntoken=4 senza padding_idx: Adenina (indice 0) sempre attiva e allenabile
+        # ntoken=4 senza padding_idx: Adenina sempre attiva e allenabile
         self.embedding = nn.Embedding(ntoken, ninp)
         self.pos_encoder = PositionalEncoding(ninp, max_len=max_len, dropout=dropout)
 
@@ -91,7 +112,7 @@ class NucleicTransformer(nn.Module):
                 ninp=ninp
             )
 
-        # Post-LN (norm_first=False) e ReLU coerenti con lo scheduler AIAYN Noam
+        # Post-LN (norm_first=False) e ReLU
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=ninp,
             nhead=nhead,
@@ -103,25 +124,24 @@ class NucleicTransformer(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
         self.norm = nn.LayerNorm(ninp)
+
+        # GeM Pooling al posto di torch.mean semplice
+        self.pool_layer = GeM(p=3.0)
         self.decoder = nn.Linear(ninp, nclass)
 
     def forward(self, src: torch.Tensor) -> torch.Tensor:
         # src: [B, L]
-        emb = self.embedding(src)       # [B, L, ninp]
-        
-        # 1. Positional Encoding applicato sui nucleotidi (come da paper)
-        emb = self.pos_encoder(emb)     # [B, L, ninp]
+        emb = self.embedding(src)           # [B, L, ninp]
+        emb = self.pos_encoder(emb)         # Positional encoding su nucleotidi
 
-        # 2. Aggregazione multi-k-mer (espande a L_tot token da 512 feature ciascuno)
         if self.kmer_aggregation:
-            emb = self.k_mer_aggregate(emb)  # [B, L_tot, ninp]
+            emb = self.k_mer_aggregate(emb) # [B, L_tot, ninp]
 
-        # 3. Transformer Encoder con Self-Attention globale su tutti i k-mer
         output = self.transformer_encoder(emb)  # [B, L_tot, ninp]
         output = self.norm(output)
 
-        # 4. Global Mean Pooling (Eq. 6 del paper) e classificazione finale
-        pooled = torch.mean(output, dim=1)      # [B, ninp]
-        logits = self.decoder(pooled)           # [B, nclass]
+        # GeM pooling lungo la dimensione temporale
+        pooled = self.pool_layer(output.permute(0, 2, 1))  # [B, ninp]
+        logits = self.decoder(pooled)                      # [B, nclass]
 
         return logits.squeeze(-1) if self.nclass == 1 else logits
