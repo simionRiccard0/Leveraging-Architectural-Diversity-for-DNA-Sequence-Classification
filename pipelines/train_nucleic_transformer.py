@@ -2,276 +2,378 @@
 # -*- coding: utf-8 -*-
 
 """
-Standalone training pipeline for Nucleic Transformer.
+Training Pipeline for Nucleic Transformer across Configs A, B, C, D.
 """
 
-import argparse
-import math
 import os
 import sys
+import copy
+import math
+import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, matthews_corrcoef
 
 from models.nucleic_transformer import NucleicTransformer
-from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset
+from utils.data_utils import resolve_task_splits, SequenceClassificationDataset
 
 
-def mutate_dna_sequence(sequence: torch.Tensor, nmute: int = 18) -> torch.Tensor:
-    """
-    Data augmentation ufficiale di Nucleic Transformer (vettorizzata):
-    seleziona nmute posizioni ed esegue la mutazione stocastica su tutto il batch.
-    """
-    if nmute <= 0:
-        return sequence
-    seq = sequence.clone()
-    batch_size, seq_len = seq.shape
-    actual_mute = min(nmute, seq_len)
-    to_mutate = torch.randperm(seq_len, device=seq.device)[:actual_mute]
-    mutations = torch.randint(0, 4, size=(batch_size, actual_mute), device=seq.device, dtype=seq.dtype)
-    seq[:, to_mutate] = mutations
-    return seq
-
+# -----------------------------------------------------------------------------
+# Loss Functions
+# -----------------------------------------------------------------------------
 
 class BinaryFocalLoss(nn.Module):
+    """Focal Loss numericamente stabile (forza il calcolo in FP32)."""
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0, smoothing: float = 0.05):
         super().__init__()
-        self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smoothing = smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        logits = logits.view(-1)
-        targets = targets.view(-1)
-        targets_smooth = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+        logits = logits.float().view(-1)
+        targets = targets.float().view(-1)
+
+        targets_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
         bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction="none")
         probs = torch.sigmoid(logits)
-        p_t = targets * probs + (1 - targets) * (1 - probs)
-        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
-        return (alpha_t * ((1 - p_t) ** self.gamma) * bce).mean()
+
+        p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
+        alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+        modulating_factor = (1.0 - p_t).clamp(min=0.0, max=1.0) ** self.gamma
+
+        return (alpha_t * modulating_factor * bce).mean()
 
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+# -----------------------------------------------------------------------------
+# Learning Rate Schedulers
+# -----------------------------------------------------------------------------
+
+class lr_AIAYN:
+    """Scheduler Noam (Attention Is All You Need) per Config C, come in LrScheduler.py."""
+    def __init__(self, optimizer, d_model: int = 512, warmup_steps: int = 3200, factor: float = 0.1):
+        self.optimizer = optimizer
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        self.factor = factor
+        self.step_num = 0
+
+    def step(self):
+        self.step_num += 1
+        lr = (self.d_model ** -0.5) * min(
+            self.step_num ** -0.5,
+            self.step_num * (self.warmup_steps ** -1.5)
+        ) * self.factor
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        return lr
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: float = 0.5):
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+
+class WarmupThenPlateau:
+    """
+    Wrapper per Config B: warmup lineare per warmup_steps step, poi passa il controllo
+    a ReduceLROnPlateau (chiamato a fine epoca su val_auc).
+    """
+    def __init__(self, optimizer, base_lr: float, warmup_steps: int, plateau_kwargs: dict):
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.warmup_steps = max(1, warmup_steps)
+        self.step_num = 0
+        self.warmup_done = False
+        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, **plateau_kwargs)
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = 0.0
+
+    def step_batch(self):
+        if self.step_num < self.warmup_steps:
+            self.step_num += 1
+            lr = self.base_lr * (self.step_num / self.warmup_steps)
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = lr
+        else:
+            self.warmup_done = True
+
+    def step_epoch(self, val_metric: float):
+        if self.warmup_done:
+            self.plateau.step(val_metric)
+
+
+# -----------------------------------------------------------------------------
+# Data Augmentation (esclusiva per Config C, Yin et al.)
+# -----------------------------------------------------------------------------
+
+def mutate_dna_sequence(sequences: torch.Tensor, nmute: int) -> torch.Tensor:
+    if nmute <= 0:
+        return sequences
+    mutated = sequences.clone()
+    B, L = mutated.shape
+    nmute = min(nmute, L - 1)
+
+    for i in range(B):
+        mute_indices = torch.randperm(L, device=sequences.device)[:nmute]
+        random_tokens = torch.randint(0, 4, (nmute,), dtype=mutated.dtype, device=sequences.device)
+        mutated[i, mute_indices] = random_tokens
+    return mutated
+
+
+# -----------------------------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------------------------
+
+def evaluate(model, dataloader, device, is_ce: bool, amp_dtype: torch.dtype):
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            x = batch["data"].to(device)
+            y = batch["label"].to(device)
+
+            with torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
+                logits = model(x)
+                if is_ce:
+                    probs = torch.softmax(logits.float(), dim=-1)[:, 1]
+                else:
+                    probs = torch.sigmoid(logits.float().view(-1))
+
+            all_preds.extend(probs.cpu().numpy().flatten())
+            all_targets.extend(y.cpu().numpy().flatten())
+
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+
+    if len(np.unique(all_targets)) < 2 or np.isnan(all_preds).any():
+        return 0.5, 0.0, 0.0
+
+    auc_score = roc_auc_score(all_targets, all_preds)
+    precision, recall, _ = precision_recall_curve(all_targets, all_preds)
+    prc_score = auc(recall, precision)
+    binary_preds = (all_preds >= 0.5).astype(int)
+    mcc_score = matthews_corrcoef(all_targets, binary_preds)
+
+    return auc_score, prc_score, mcc_score
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Nucleic Transformer Training Pipeline with AMP")
+    parser = argparse.ArgumentParser(description="Train Nucleic Transformer with AMP and Model Soup")
+    parser.add_argument("--task", type=str, required=True, choices=["viral", "anellovirus", "ecoli", "enhancer"])
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
-    parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--data_folder", default="/home/simionricc/datasets")
-    parser.add_argument("--checkpoint_dir", default="./checkpoints")
+    parser.add_argument("--data_folder", type=str, default="/home/simionricc/datasets")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
     parser.add_argument("--batch_size", type=int, default=24)
-    parser.add_argument("--epochs", type=int, default=None, help="Sovrascrive il numero di epoche di default")
-    parser.add_argument("--nmute", type=int, default=18, help="Numero di mutazioni stocastiche (0 per disabilitare)")
-    parser.add_argument("--top_k_swa", type=int, default=3, help="Numero di migliori checkpoint per il Model Soup finale")
+    parser.add_argument("--nmute", type=int, default=18, help="Mutazioni stocastiche per Config C (paper: 40, repo: 18)")
+    parser.add_argument("--top_k_swa", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2020)
-    parser.add_argument("--no_amp", action="store_true", help="Disabilita Mixed Precision FP16")
+    parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"],
+                        help="bf16 e' piu' stabile su sequenze lunghe se la GPU lo supporta")
     args = parser.parse_args()
 
-    seed_everything(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = (torch.cuda.is_available() and not args.no_amp)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    config_map = {
-        "A": {"epochs": 120, "early_stop": True, "patience": 15, "loss": "focal", "opt": "adamw", "sched": "cosine", "drop": 0.25, "out": 1},
-        "B": {"epochs": 30, "early_stop": False, "patience": 0, "loss": "bce", "opt": "adam", "sched": "step", "drop": 0.2, "out": 1},
-        "C": {"epochs": 100, "early_stop": False, "patience": 0, "loss": "ce", "opt": "adam", "sched": "aiayn", "drop": 0.1, "out": 2},
-        "D": {"epochs": 30, "early_stop": True, "patience": 8, "loss": "ce", "opt": "adamw", "sched": "warmup_cosine", "drop": 0.5, "out": 2},
-    }
-    cfg = config_map[args.config]
-    if args.epochs is not None:
-        cfg["epochs"] = args.epochs
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+
+    # 1. Split del dataset
+    train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, seed=args.seed)
+
+    # 2. Config D allineata al framework globale (2 classi con CrossEntropy)
+    dropout_map = {"A": 0.25, "B": 0.2, "C": 0.1, "D": 0.5}
+    drop = dropout_map[args.config]
 
     is_ce = (args.config in ["C", "D"])
+    nclass = 2 if is_ce else 1
 
-    train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
-    print(f"[i] Training Nucleic Transformer | Task: '{args.task}' | Config: '{args.config}' | Input: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)} | nmute: {args.nmute} | top_k_swa: {args.top_k_swa} | AMP: {use_amp}")
+    # 3. Dataset
+    train_ds = SequenceClassificationDataset(
+        train_df["sequence"].tolist(), train_df["label"].tolist(),
+        arch="nucleictransformer", target_len=seq_len, config=args.config, is_train=True
+    )
+    val_ds = SequenceClassificationDataset(
+        val_df["sequence"].tolist(), val_df["label"].tolist(),
+        arch="nucleictransformer", target_len=seq_len, config=args.config, is_train=False
+    )
 
+    # 4. Sampler pesato per Config C e D sui task sbilanciati (viral, anellovirus)
     num_pos = float(train_df["label"].sum())
     num_neg = float(len(train_df) - num_pos)
-    pos_weight_ratio = num_neg / max(1.0, num_pos)
+    imbalance_ratio = num_neg / max(1.0, num_pos)
+    use_weighted_sampler = is_ce and imbalance_ratio > 5.0
 
-    tr_ds = SequenceClassificationDataset(train_df["sequence"].tolist(), train_df["label"].tolist(), "nucleictransformer", seq_len, args.config, is_train=True)
-    val_ds = SequenceClassificationDataset(val_df["sequence"].tolist(), val_df["label"].tolist(), "nucleictransformer", seq_len, args.config, is_train=False)
+    if use_weighted_sampler:
+        labels_arr = train_df["label"].to_numpy()
+        class_sample_weight = np.where(labels_arr > 0.5, num_neg / max(1.0, num_pos), 1.0)
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(class_sample_weight, dtype=torch.double),
+            num_samples=len(train_ds),
+            replacement=True
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
+                                  num_workers=2, pin_memory=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=2, pin_memory=True)
 
-    tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False, num_workers=2, pin_memory=True)
 
+    total_epochs = {"A": 120, "B": 30, "C": 100, "D": 20}[args.config]
+
+    print(f"[i] Training Nucleic Transformer | Task: '{args.task}' | Config: '{args.config}' | "
+          f"Loss: {'CrossEntropy (2 classes)' if is_ce else 'Binary'} | Input: {seq_len} bp | "
+          f"Train: {len(train_ds)} | Val: {len(val_ds)} | nmute: {args.nmute if args.config == 'C' else 0} | "
+          f"dropout: {drop} | weighted_sampler: {use_weighted_sampler} | "
+          f"top_k_swa: {args.top_k_swa} | AMP dtype: {args.amp_dtype}")
+
+    # 5. Istanziazione modello
     model = NucleicTransformer(
-        ntoken=4,
-        nclass=cfg["out"],
-        ninp=512,
-        nhead=8,
-        nhid=2048,
-        nlayers=6,
-        kmer_aggregation=True,
-        kmers=[2, 3, 4, 5, 6],
-        dropout=cfg["drop"],
-        max_len=max(2000, seq_len + 100)
+        ntoken=4, nclass=nclass, ninp=512, nhead=8, nhid=2048, nlayers=6,
+        kmer_aggregation=True, kmers=[2, 3, 4, 5, 6], dropout=drop,
+        max_len=max(2000, seq_len * 6)
     ).to(device)
 
-    # Configurazione Loss: Config C utilizza Cross-Entropy standard non pesata
-    if cfg["loss"] == "focal":
-        alpha = min(0.95, max(0.5, pos_weight_ratio / (pos_weight_ratio + 1.0)))
+    # 6. Ottimizzatori, scheduler, loss
+    total_steps = len(train_loader) * total_epochs
+    warmup_plateau = None
+
+    if args.config == "A":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.05), num_training_steps=total_steps)
+        alpha = min(0.90, max(0.5, imbalance_ratio / (imbalance_ratio + 1.0)))
         criterion = BinaryFocalLoss(alpha=alpha, gamma=2.0)
-    elif cfg["loss"] == "bce":
-        pos_weight_t = torch.tensor([pos_weight_ratio], device=device).float()
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
+    elif args.config == "B":
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.0)
+        warmup_steps_b = min(len(train_loader), 2000)
+        warmup_plateau = WarmupThenPlateau(
+            optimizer, base_lr=1e-3, warmup_steps=warmup_steps_b,
+            plateau_kwargs=dict(mode="max", factor=0.5, patience=3)
+        )
+        criterion = nn.BCEWithLogitsLoss()
     elif args.config == "C":
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0, weight_decay=0.0)
+        aiayn_sched = lr_AIAYN(optimizer, d_model=512, warmup_steps=3200, factor=0.1)
         criterion = nn.CrossEntropyLoss()
-    else:
-        class_weights = torch.tensor([1.0, pos_weight_ratio], device=device).float()
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    elif args.config == "D":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
+        criterion = nn.CrossEntropyLoss()
 
-    total_steps = len(tr_loader) * cfg["epochs"]
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16))
 
-    if cfg["opt"] == "adamw":
-        wd = 0.05 if args.config == "D" else 1e-4
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=wd)
-    else:
-        lr_base = 0.001 if args.config == "B" else 1.0
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr_base)
+    saved_checkpoints = []
+    best_val_auc = -1.0
+    patience = 8 if args.config == "D" else (15 if args.config in ["A", "C"] else 30)
+    patience_counter = 0
 
-    if cfg["sched"] == "cosine":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5)))
-        )
-    elif cfg["sched"] == "warmup_cosine":
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps
-        )
-    elif cfg["sched"] == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-    else:
-        d_model = 512
-        warmup_steps = 3200
-        lr_scale = 0.1
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lambda s: lr_scale * (d_model ** -0.5) * min(max(1, s) ** -0.5, max(1, s) * (warmup_steps ** -1.5))
-        )
-
-    # Inizializzazione GradScaler per precisione mista
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    best_auc, patience_cnt = 0.0, 0
-    top_models = []
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    best_path = os.path.join(args.checkpoint_dir, f"best_nucleictransformer_{args.task}_{args.config}.pt")
-
-    for epoch in range(1, cfg["epochs"] + 1):
+    # 7. Training loop
+    for epoch in range(1, total_epochs + 1):
         model.train()
         total_loss = 0.0
+        steps = 0
 
-        for batch in tr_loader:
+        for batch in train_loader:
+            x = batch["data"].to(device)
+            y = batch["label"].to(device)
+
+            # Mutazione stocastica applicata esclusivamente a Config C (Yin et al.)
+            if args.config == "C" and args.nmute > 0:
+                x = mutate_dna_sequence(x, args.nmute)
+
             optimizer.zero_grad(set_to_none=True)
-            src = batch["data"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True)
 
-            if args.nmute > 0:
-                src = mutate_dna_sequence(src, args.nmute)
+            with torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
+                logits = model(x)
+                if is_ce:
+                    loss = criterion(logits.float(), y.long().view(-1))
+                else:
+                    loss = criterion(logits.float().view(-1), y.float().view(-1))
 
-            target_dtype = labels.view(-1).long() if is_ce else labels.view(-1).float()
-
-            # Forward pass con context manager autocast
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                output = model(src)
-                loss = criterion(output, target_dtype)
-
-            # Backward pass scalato
             scaler.scale(loss).backward()
-
-            # Unscale esplicito necessario prima del gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if args.config == "D" else 1.0)
-
-            # Step dell'ottimizzatore mediato dallo scaler
             scaler.step(optimizer)
             scaler.update()
 
-            if cfg["sched"] in ["aiayn", "warmup_cosine"]:
+            if args.config == "C":
+                aiayn_sched.step()
+            elif args.config == "B":
+                warmup_plateau.step_batch()
+            elif args.config in ["A", "D"]:
                 scheduler.step()
-            total_loss += loss.item() * len(src)
 
-        if cfg["sched"] not in ["aiayn", "warmup_cosine"]:
-            scheduler.step()
+            total_loss += loss.item() if not math.isnan(loss.item()) else 0.0
+            steps += 1
 
-        model.eval()
-        preds, targets = [], []
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                for batch in val_loader:
-                    src = batch["data"].to(device, non_blocking=True)
-                    out = model(src)
-                    probs = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out.view(-1))
-                    preds.extend(probs.cpu().numpy().flatten())
-                    targets.extend(batch["label"].cpu().numpy().flatten())
+        train_loss = total_loss / max(steps, 1)
+        val_auc, val_prc, val_mcc = evaluate(model, val_loader, device, is_ce=is_ce, amp_dtype=amp_dtype)
 
-        preds_arr = np.nan_to_num(np.array(preds), nan=0.5)
-        targets_arr = np.array(targets)
+        if args.config == "B":
+            warmup_plateau.step_epoch(val_auc)
 
-        val_auc = roc_auc_score(targets_arr, preds_arr) if len(np.unique(targets_arr)) > 1 else 0.5
-        val_prc = average_precision_score(targets_arr, preds_arr) if len(np.unique(targets_arr)) > 1 else 0.0
-        val_mcc = matthews_corrcoef(targets_arr, (preds_arr >= 0.5).astype(int)) if len(np.unique(targets_arr)) > 1 else 0.0
+        print(f"Epoch {epoch:03d}/{total_epochs:03d} | Train Loss: {train_loss:.4f} | "
+              f"Val AUC: {val_auc:.4f} | Val PRC: {val_prc:.4f} | Val MCC: {val_mcc:.4f}")
 
-        print(f"Epoch {epoch:03d}/{cfg['epochs']:03d} | Train Loss: {total_loss/len(tr_ds):.4f} | Val AUC: {val_auc:.4f} | Val PRC: {val_prc:.4f} | Val MCC: {val_mcc:.4f}")
+        if val_auc > 0.55:
+            state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+            saved_checkpoints.append((val_auc, epoch, state_dict_cpu))
+            saved_checkpoints.sort(key=lambda item: item[0], reverse=True)
+            if len(saved_checkpoints) > args.top_k_swa:
+                saved_checkpoints.pop()
 
-        # Tracciamento dei Top-K modelli per Model Soup / SWA
-        if len(top_models) < args.top_k_swa or val_auc > top_models[-1][0]:
-            state_cpu = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            top_models.append((val_auc, epoch, state_cpu))
-            top_models.sort(key=lambda x: x[0], reverse=True)
-            if len(top_models) > args.top_k_swa:
-                top_models.pop(-1)
-
-        if val_auc > best_auc:
-            best_auc = val_auc
-            patience_cnt = 0
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            patience_counter = 0
         else:
-            patience_cnt += 1
-            if cfg["early_stop"] and patience_cnt >= cfg["patience"]:
-                print(f"Early stopping at epoch {epoch}.")
-                break
+            patience_counter += 1
 
-    # Fusione dei checkpoint (Model Soup / SWA)
-    if args.top_k_swa > 1 and len(top_models) > 1:
-        print(f"\n[i] Calcolo Weight Averaging (Model Soup) sui migliori {len(top_models)} checkpoint:")
-        avg_dict = {}
-        for rank, (auc_score, ep, state) in enumerate(top_models, 1):
-            print(f"   -> Top {rank}: Epoca {ep:03d} (Val AUC: {auc_score:.4f})")
-            for k, v in state.items():
-                if k not in avg_dict:
-                    avg_dict[k] = v.float().clone()
-                else:
-                    avg_dict[k] += v.float()
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch}.")
+            break
 
-        for k in avg_dict:
-            avg_dict[k] = (avg_dict[k] / float(len(top_models))).to(dtype=top_models[0][2][k].dtype)
+    # 8. Model Soup / SWA
+    out_ckpt = os.path.join(args.checkpoint_dir, f"best_nucleictransformer_{args.task}_{args.config}.pt")
 
-        torch.save({
-            "model_state_dict": avg_dict,
-            "epoch": top_models[0][1],
-            "val_auc": top_models[0][0],
-            "averaged_epochs": [m[1] for m in top_models]
-        }, best_path)
-        print(f"[✓] Checkpoint Model Soup salvato: {best_path} (Peak Val AUC: {best_auc:.4f})")
+    if saved_checkpoints:
+        print(f"\n[i] Calcolo Weight Averaging (Model Soup) sui migliori {len(saved_checkpoints)} checkpoint:")
+        for idx, (score, ep, _) in enumerate(saved_checkpoints):
+            print(f"   -> Top {idx+1}: Epoca {ep:03d} (Val AUC: {score:.4f})")
+
+        soup_state = copy.deepcopy(saved_checkpoints[0][2])
+        for key in soup_state.keys():
+            for i in range(1, len(saved_checkpoints)):
+                soup_state[key] += saved_checkpoints[i][2][key]
+            soup_state[key] = soup_state[key] / float(len(saved_checkpoints))
+
+        torch.save(soup_state, out_ckpt)
+        print(f"Checkpoint Model Soup salvato: {out_ckpt} (Peak Val AUC: {best_val_auc:.4f})")
     else:
-        torch.save({
-            "model_state_dict": top_models[0][2],
-            "epoch": top_models[0][1],
-            "val_auc": top_models[0][0]
-        }, best_path)
-        print(f"Checkpoint singolo salvato: {best_path} (Val AUC: {best_auc:.4f})")
+        torch.save(model.state_dict(), out_ckpt)
+        print(f"Nessun checkpoint qualificato (>0.55). Salvato ultimo stato in: {out_ckpt}")
+
 
 if __name__ == "__main__":
     main()

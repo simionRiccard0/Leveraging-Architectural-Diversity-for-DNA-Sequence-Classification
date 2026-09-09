@@ -2,13 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Nucleic Transformer (Yin et al.) - Exact Paper Architecture with GeM Pooling.
-Features:
-- K-mer aggregation with padding=0 concatenated along the sequence length axis (L_tot=1485).
-- Positional Encoding applied on nucleotide embeddings before k-mer aggregation.
-- Post-LN (norm_first=False) and standard ReLU activations.
-- Embedding without padding_idx to ensure full Adenine gradient updates.
-- Generalized Mean Pooling (GeM, p=3) matching Network.py (replaces plain torch.mean).
+Nucleic Transformer (Yin et al.) - Architecture matching repository's Network.py.
 """
 
 import math
@@ -39,9 +33,10 @@ class PositionalEncoding(nn.Module):
 
 class K_mer_aggregate(nn.Module):
     """
-    K-mer Aggregator originale (Yin et al.):
+    K-mer Aggregator originale (Yin et al. / Network.py):
     applica Conv1d con padding=0 per ogni k-mer (out_channels = ninp)
     e concatena lungo l'asse temporale della sequenza.
+    L_tot = sum(L - k + 1)
     """
     def __init__(self, kmers: list, ninp: int = 512):
         super().__init__()
@@ -58,18 +53,25 @@ class K_mer_aggregate(nn.Module):
         outputs = []
         for conv in self.convs:
             outputs.append(conv(x_conv))
-        
-        # Concatena lungo la dimensione della sequenza (dim=2): L_tot = sum(L - k + 1)
-        fused = torch.cat(outputs, dim=2)  # [B, ninp, L_tot]
-        fused = fused.permute(0, 2, 1)     # [B, L_tot, ninp]
+
+        # Concatena lungo la dimensione della sequenza (dim=2): [B, ninp, L_tot]
+        fused = torch.cat(outputs, dim=2)
+        fused = fused.permute(0, 2, 1)  # [B, L_tot, ninp]
         return self.norm(F.relu(fused))
 
 
 class GeM(nn.Module):
     """
-    Generalized Mean Pooling (GeM) da Network.py (Yin et al.):
+    Generalized Mean Pooling coerente con Network.py, con hardening numerico
+    per compatibilita' con torch.cuda.amp (FP16/BF16):
     f(x) = ( 1/L * sum( clamp(x, min=eps)^p ) )^(1/p)
-    Preserva i motivi locali rari evitando la cancellazione da media globale su L=1485.
+
+    Dettagli dell'hardening (assenti in Network.py, aggiunti solo per AMP nativo):
+    - Cast a float32 prima di pow(p), per evitare overflow FP16 (>65504).
+    - Clamp del parametro p (apprendibile) in [1.0, 10.0], per evitare potenze
+      negative o esplosioni non convesse durante il training.
+    - Clamp del risultato del pooling prima di pow(1/p), per evitare radici di
+      numeri negativi o divisioni per zero.
     """
     def __init__(self, p: float = 3.0, eps: float = 1e-6):
         super().__init__()
@@ -78,9 +80,15 @@ class GeM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, ninp, L]
-        x_clamped = x.clamp(min=self.eps).pow(self.p)
-        pooled = F.adaptive_avg_pool1d(x_clamped, 1).pow(1.0 / self.p)
-        return pooled.squeeze(-1)  # [B, ninp]
+        orig_dtype = x.dtype
+        x_fp32 = x.float()
+
+        p_clamped = self.p.float().clamp(min=1.0, max=10.0)
+
+        x_clamped = x_fp32.clamp(min=self.eps).pow(p_clamped)
+        pooled = F.adaptive_avg_pool1d(x_clamped, 1).clamp(min=self.eps).pow(1.0 / p_clamped)
+
+        return pooled.squeeze(-1).to(orig_dtype)  # [B, ninp]
 
 
 class NucleicTransformer(nn.Module):
@@ -102,7 +110,7 @@ class NucleicTransformer(nn.Module):
         self.ninp = ninp
         self.kmer_aggregation = kmer_aggregation
 
-        # ntoken=4 senza padding_idx: Adenina sempre attiva e allenabile
+        # ntoken=4 senza padding_idx: Adenina (indice 0) sempre attiva e allenabile
         self.embedding = nn.Embedding(ntoken, ninp)
         self.pos_encoder = PositionalEncoding(ninp, max_len=max_len, dropout=dropout)
 
@@ -125,7 +133,7 @@ class NucleicTransformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
         self.norm = nn.LayerNorm(ninp)
 
-        # GeM Pooling al posto di torch.mean semplice
+        # GeM Pooling (vedi nota di fedelta' in cima al file)
         self.pool_layer = GeM(p=3.0)
         self.decoder = nn.Linear(ninp, nclass)
 
@@ -135,7 +143,7 @@ class NucleicTransformer(nn.Module):
         emb = self.pos_encoder(emb)         # Positional encoding su nucleotidi
 
         if self.kmer_aggregation:
-            emb = self.k_mer_aggregate(emb) # [B, L_tot, ninp]
+            emb = self.k_mer_aggregate(emb)  # [B, L_tot, ninp]
 
         output = self.transformer_encoder(emb)  # [B, L_tot, ninp]
         output = self.norm(output)
