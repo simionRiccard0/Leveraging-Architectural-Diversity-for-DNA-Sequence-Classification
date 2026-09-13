@@ -5,7 +5,6 @@
 Universal Standalone Inference Script:
 Extracts logit files across all benchmark test sets.
 Supports: GenExplorer, Nucleic Transformer, DNABERT2-CAMP, and FullE 10-Model Sum-Rule Ensemble.
-Fully aligned with the 4x4 Cross-Benchmarking framework (Strategies A, B, C, D).
 """
 
 import argparse
@@ -27,6 +26,7 @@ def get_default_model_path():
 
 
 def evaluate_loader(model, loader, is_ce, is_dnabert, is_fulle, device):
+    # INVARIATO rispetto alla versione precedente: nessuna modifica in questa funzione.
     model.eval()
     all_logits, all_targets = [], []
     with torch.no_grad():
@@ -62,6 +62,14 @@ def main():
     parser.add_argument("--data_folder", default="/home/simionricc/datasets")
     parser.add_argument("--logits_dir", default="./global_logits")
     parser.add_argument("--test_csv", default=None, help="Optional direct test CSV path")
+    # --- Nuovi argomenti, usati SOLO da arch=nucleictransformer (vedi piu' sotto) ---
+    parser.add_argument("--kmers", type=int, nargs="+", default=[2, 3, 4, 5, 6],
+                         help="[Solo nucleictransformer] Kernel size(s) del checkpoint da caricare. "
+                              "Non ha alcun effetto su genexplorer/dnabert2camp/fulle.")
+    parser.add_argument("--suffix", type=str, default="",
+                         help="[Solo nucleictransformer] Suffisso per il nome del file di logit "
+                              "(es. _k13 o _nmute40), per non sovrascrivere run di ablazione diversi. "
+                              "Non ha alcun effetto su genexplorer/dnabert2camp/fulle.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,6 +85,7 @@ def main():
     tokenizer = None
 
     if args.arch == "genexplorer":
+        # INVARIATO
         from models.genexplorer import GenExplorer
         model = GenExplorer(out_features=num_classes, max_len=max(512, seq_len))
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -84,13 +93,18 @@ def main():
         model.to(device).eval()
 
     elif args.arch == "nucleictransformer":
+        # UNICA MODIFICA: kmers=args.kmers invece di lasciare il default della classe.
+        # Con args.kmers=[2,3,4,5,6] (default di questo script) il comportamento e'
+        # identico a prima: NucleicTransformer(ntoken=4, nclass=num_classes, ninp=512)
+        # usa gia' [2,3,4,5,6] come default interno.
         from models.nucleic_transformer import NucleicTransformer
-        model = NucleicTransformer(ntoken=4, nclass=num_classes, ninp=512)
+        model = NucleicTransformer(ntoken=4, nclass=num_classes, ninp=512, kmers=args.kmers)
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt)
         model.to(device).eval()
 
     elif args.arch == "dnabert2camp":
+        # INVARIATO
         from transformers import AutoTokenizer
         from models.dnabert2_camp import DNABERT2CAMP
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
@@ -100,6 +114,7 @@ def main():
         model.to(device).eval()
 
     elif args.arch == "fulle":
+        # INVARIATO
         from models.fulle import FullEBranch, FullEMerger, FullE10Ensemble
         ckpt = torch.load(args.checkpoint, map_location=device)
 
@@ -143,6 +158,12 @@ def main():
         "fulle": "fulle"
     }
 
+    # Suffisso applicato al nome file SOLO per nucleictransformer. Per tutti gli
+    # altri arch, effective_suffix resta "" a prescindere da cosa contiene
+    # args.suffix: il nome del file di logit per genexplorer/dnabert2camp/fulle
+    # e' quindi bit-per-bit identico a prima, in ogni caso.
+    effective_suffix = args.suffix if (args.arch == "nucleictransformer" and args.suffix) else ""
+
     print(f"\n--- Cascade Evaluation: {args.arch} (Config {args.config}, Task {args.task}) ---")
     for d_name, d_path in cascade_dict.items():
         if not os.path.exists(d_path):
@@ -162,7 +183,7 @@ def main():
         auc, prc, mcc, raw_logits = evaluate_loader(model, eval_loader, is_ce, is_dnabert, is_fulle, device)
         print(f" -> [{d_name}] AUROC: {auc:.4f} | AUPRC: {prc:.4f} | MCC: {mcc:.4f}")
 
-        out_fname = f"{prefix_map[args.arch]}_cfg{args.config}_{args.task}_{d_name}.txt"
+        out_fname = f"{prefix_map[args.arch]}_cfg{args.config}{effective_suffix}_{args.task}_{d_name}.txt"
         out_fpath = os.path.join(args.logits_dir, out_fname)
         np.savetxt(out_fpath, raw_logits, fmt="%.6f")
         print(f"    Logits saved: {out_fname}")
