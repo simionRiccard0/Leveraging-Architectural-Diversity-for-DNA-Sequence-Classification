@@ -10,7 +10,7 @@ try:
     from .dnabert2_camp import DNABERT2CAMP
     __all__ = [
         "GenExplorer",
-        "FullEEnsemble",
+        "FullE10Ensemble",
         "FullEBranch",
         "FullEMerger",
         "NucleicTransformer",
@@ -19,7 +19,7 @@ try:
 except ImportError:
     __all__ = [
         "GenExplorer",
-        "FullEEnsemble",
+        "FullE10Ensemble",
         "FullEBranch",
         "FullEMerger",
         "NucleicTransformer",

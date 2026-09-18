@@ -40,8 +40,7 @@ class BinaryFocalLoss(nn.Module):
 
 
 def get_default_model_path():
-    local_p = "/nfsd/nannidl/simionricc/models/dnabert2_camp/model"
-    return local_p if os.path.exists(local_p) else "zhihan1996/DNABERT-2-117M"
+    return os.environ.get("DNABERT2_MODEL_PATH", "zhihan1996/DNABERT-2-117M")
 
 
 def evaluate_model(model, dataloader, is_ce, device):
@@ -72,10 +71,10 @@ def main():
     parser = argparse.ArgumentParser(description="DNABERT2-CAMP Fine-tuning & Cascade Pipeline")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--data_folder", default="/home/simionricc/datasets")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
     parser.add_argument("--model_name_or_path", default=get_default_model_path())
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
-    parser.add_argument("--logits_dir", default="./global_logits")
+    parser.add_argument("--logits_dir", default="./global_logits_monolithic")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--backbone_lr", type=float, default=2e-5)
     parser.add_argument("--head_lr", type=float, default=1e-4)

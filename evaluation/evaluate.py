@@ -21,8 +21,7 @@ from utils.data_utils import load_seq_label_dataframe, resolve_task_splits, Sequ
 
 
 def get_default_model_path():
-    local_p = "/nfsd/nannidl/simionricc/models/dnabert2_camp/model"
-    return local_p if os.path.exists(local_p) else "zhihan1996/DNABERT-2-117M"
+    return os.environ.get("DNABERT2_MODEL_PATH", "zhihan1996/DNABERT-2-117M")
 
 
 def evaluate_loader(model, loader, is_ce, is_dnabert, is_fulle, device):
@@ -59,7 +58,7 @@ def main():
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint (.pt/.pth)")
     parser.add_argument("--model_name_or_path", default=get_default_model_path())
-    parser.add_argument("--data_folder", default="/home/simionricc/datasets")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
     parser.add_argument("--logits_dir", default="./global_logits")
     parser.add_argument("--test_csv", default=None, help="Optional direct test CSV path")
     # --- Nuovi argomenti, usati SOLO da arch=nucleictransformer (vedi piu' sotto) ---

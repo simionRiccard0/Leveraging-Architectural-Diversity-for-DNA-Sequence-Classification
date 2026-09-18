@@ -25,10 +25,9 @@ pd.set_option('display.max_columns', 25)
 pd.set_option('display.width', 1000)
 
 DATA_DIRS = [
-    "/home/simionricc/datasets",
+    os.environ.get("DATA_DIR", "./datasets"),
     "./datasets",
-    "../datasets",
-    "/nfsd/nannidl/simionricc/datasets"
+    "../datasets"
 ]
 
 PRIMARY_TESTS = ["test_ecoli", "test_enhancer", "test_anellovirus", "test_VM"]

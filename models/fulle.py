@@ -1,5 +1,5 @@
 """
-FullE: 10-Subnetwork Convolutional Neural Network Ensemble with Parameterized Lp Pooling (Eq. 3).
+FullE: 10-Subnetwork Convolutional Neural Network Ensemble with Parameterized Lp Pooling.
 """
 
 from typing import List, Dict

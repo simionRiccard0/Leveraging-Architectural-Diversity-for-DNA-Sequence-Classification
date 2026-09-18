@@ -40,15 +40,14 @@ class BinaryFocalLoss(nn.Module):
 
 
 def get_default_model_path():
-    local_p = "/nfsd/nannidl/simionricc/models/dnabert2_camp/model"
-    return local_p if os.path.exists(local_p) else "zhihan1996/DNABERT-2-117M"
+    return os.environ.get("DNABERT2_MODEL_PATH", "zhihan1996/DNABERT-2-117M")
 
 
 def main():
     parser = argparse.ArgumentParser(description="DNABERT2-CAMP Fine-tuning Pipeline")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--data_folder", default="/home/simionricc/datasets")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
     parser.add_argument("--model_name_or_path", default=get_default_model_path())
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
     parser.add_argument("--batch_size", type=int, default=16)

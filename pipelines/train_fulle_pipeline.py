@@ -118,9 +118,9 @@ def main():
     parser = argparse.ArgumentParser(description="FullE Complete 10-Subnetwork Training & Cascade Pipeline")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--data_folder", default="/home/simionricc/datasets")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
-    parser.add_argument("--logits_dir", default="./global_logits")
+    parser.add_argument("--logits_dir", default="./global_logits_monolithic")
     parser.add_argument("--seed", type=int, default=2020)
     args = parser.parse_args()
 

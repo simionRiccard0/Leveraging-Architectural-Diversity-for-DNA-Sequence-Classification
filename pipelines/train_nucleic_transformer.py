@@ -185,7 +185,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train Nucleic Transformer with AMP and Model Soup")
     parser.add_argument("--task", type=str, required=True, choices=["viral", "anellovirus", "ecoli", "enhancer"])
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
-    parser.add_argument("--data_folder", type=str, default="/home/simionricc/datasets")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--epochs", type=int, default=None, help="Override numero epoche (default: A:120, B:30, C:100, D:30)")
