@@ -25,7 +25,7 @@ We benchmark four distinct architectural paradigms, exploring the trade-offs bet
 | :--- | :--- | :--- |
 | **Hybrid Multi-Branch** | **GenExplorer** | Combines multi-scale 1D convolutions (`PatternBranch` with max pooling and `FrequencyBranch` with average pooling) with a parallel 4-layer `TransformerBranch` to simultaneously capture local motifs, base frequencies, and global positional context via late MLP fusion. |
 | **Multi-Branch CNN Ensemble** | **FullE** | An ensemble of 1D CNN subnetworks featuring multi-scale convolutions and parameterized $L_p$ power-average pooling—which dynamically interpolates between mean pooling ($p=1$) and max pooling ($p \to \infty$). Submodels and merger networks are combined via a 10-model Sum-Rule decision fusion. |
-| **Convolutional Transformer** | **Nucleic Transformer** | Formulates sequence classification using 1D convolutional $k$-mer tokenization (kernels $k \in \{2..6\}$) to generate learnable $k$-mer tokens, followed by a 6-layer Transformer Encoder stack with global mean pooling. |
+| **Convolutional Transformer** | **Nucleic Transformer** | Formulates sequence classification using 1D convolutional $k$-mer tokenization (kernels $k \in \{2..6\}$) to generate learnable $k$-mer tokens, followed by a 6-layer Transformer Encoder stack with Generalized Mean (GeM) Pooling with learnable power parameter $p$. |
 |**Genomic Foundation Model** | **DNABERT2-CAMP** | Leverages the pre-trained DNABERT-2 (117M) transformer backbone fine-tuned alongside a CAMP (Convolutional Attention Motif Profiler) module—a 4-layer 1D CNN cascade coupled with Multi-Head Self-Attention for localized motif refinement. |
 ---
 
@@ -141,6 +141,7 @@ directory using a standardized organization based on:
   * `cfgA`
   * `cfgB`
   * `cfgC`
+  * `cfgD`
 
 * **Training Task**
 
@@ -263,7 +264,7 @@ python pipelines/train_fulle_pipeline.py \
 
 ## Cross-Configuration Evaluation
 
-Each architecture can be executed using any of the three optimization strategies described above.
+Each architecture can be executed using any of the four optimization strategies described above.
 
 Consequently, the benchmark supports two complementary analyses:
 
