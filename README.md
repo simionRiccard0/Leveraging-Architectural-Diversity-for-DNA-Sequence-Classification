@@ -263,7 +263,7 @@ python pipelines/train_fulle_pipeline.py \
 
 ## Cross-Configuration Evaluation
 
-Each architecture can be executed using any of the three optimization strategies described above.
+Each architecture can be executed using any of the four optimization strategies described above.
 
 Consequently, the benchmark supports two complementary analyses:
 
