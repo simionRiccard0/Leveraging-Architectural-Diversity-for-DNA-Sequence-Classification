@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Training Pipeline for Nucleic Transformer across Configs A, B, C, D.
+Standalone training pipeline for Nucleic Transformer across Configurations A, B, C, and D.
+Supports mixed-precision training (AMP), Model Soup (SWA), and length-adaptive stochastic mutations.
 """
 
 import os
@@ -33,7 +34,7 @@ from utils.data_utils import resolve_task_splits, SequenceClassificationDataset
 # -----------------------------------------------------------------------------
 
 class BinaryFocalLoss(nn.Module):
-    """Focal Loss numericamente stabile (forza il calcolo in FP32)."""
+    """Numerically stable focal loss computed in FP32."""
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0, smoothing: float = 0.05):
         super().__init__()
         self.alpha = alpha
@@ -60,7 +61,7 @@ class BinaryFocalLoss(nn.Module):
 # -----------------------------------------------------------------------------
 
 class lr_AIAYN:
-    """Scheduler Noam (Attention Is All You Need) per Config C, come in LrScheduler.py."""
+    """Noam inverse-square-root schedule for Config C."""
     def __init__(self, optimizer, d_model: int = 512, warmup_steps: int = 3200, factor: float = 0.1):
         self.optimizer = optimizer
         self.d_model = d_model
@@ -89,12 +90,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_traini
 
 
 class WarmupThenPlateau:
-    """
-    Wrapper per Config B: warmup lineare per warmup_steps step, poi passa il controllo
-    a ReduceLROnPlateau (chiamato manualmente a fine epoca su val_auc).
-    Risolve il collasso a AUC 0.5 osservato quando lr=1e-3 veniva applicato di colpo
-    dall'epoca 1 su un transformer Post-LN.
-    """
+    """Linear warmup followed by ReduceLROnPlateau for Config B Post-LN stability."""
     def __init__(self, optimizer, base_lr: float, warmup_steps: int, plateau_kwargs: dict):
         self.optimizer = optimizer
         self.base_lr = base_lr
@@ -120,11 +116,11 @@ class WarmupThenPlateau:
 
 
 # -----------------------------------------------------------------------------
-# Data Augmentation (esclusiva per Config C)
+# Data Augmentation
 # -----------------------------------------------------------------------------
 
 def mutate_dna_sequence(sequences: torch.Tensor, nmute: int) -> torch.Tensor:
-    """Mutazione stocastica di basi, applicata solo a Config C (Yin et al.)."""
+    """Stochastic nucleotide mutation applied only in Config C."""
     if nmute <= 0:
         return sequences
     mutated = sequences.clone()
@@ -139,7 +135,7 @@ def mutate_dna_sequence(sequences: torch.Tensor, nmute: int) -> torch.Tensor:
 
 
 # -----------------------------------------------------------------------------
-# Evaluation
+# Evaluation Helper
 # -----------------------------------------------------------------------------
 
 def evaluate(model, dataloader, device, is_ce: bool, amp_dtype: torch.dtype):
@@ -149,8 +145,8 @@ def evaluate(model, dataloader, device, is_ce: bool, amp_dtype: torch.dtype):
 
     with torch.no_grad():
         for batch in dataloader:
-            x = batch["data"].to(device)
-            y = batch["label"].to(device)
+            x = batch["data"].to(device, non_blocking=True)
+            y = batch["label"].to(device, non_blocking=True)
 
             with torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
                 logits = model(x)
@@ -178,31 +174,29 @@ def evaluate(model, dataloader, device, is_ce: bool, amp_dtype: torch.dtype):
 
 
 # -----------------------------------------------------------------------------
-# Main
+# Main Execution
 # -----------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Nucleic Transformer with AMP and Model Soup")
+    parser = argparse.ArgumentParser(description="Standalone Training for Nucleic Transformer")
     parser.add_argument("--task", type=str, required=True, choices=["viral", "anellovirus", "ecoli", "enhancer"])
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
-    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"),
+                        help="Root dataset directory (default: './datasets' or $DATA_DIR)")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
     parser.add_argument("--batch_size", type=int, default=24)
-    parser.add_argument("--epochs", type=int, default=None, help="Override numero epoche (default: A:120, B:30, C:100, D:30)")
-    parser.add_argument("--nmute", type=int, default=40, help="Mutazioni stocastiche per Config C (paper: 40 per il task virale, 15 per ecoli)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override default epochs (A:120, B:30, C:100, D:30)")
+    parser.add_argument("--nmute", type=int, default=40,
+                        help="Mutation upper bound (dynamically capped at 0.13 * L)")
     parser.add_argument("--kmers", type=int, nargs="+", default=[2, 3, 4, 5, 6],
-                         help="Kernel size(s) per la k-mer aggregation. Default: multi-k [2,3,4,5,6] "
-                              "(comportamento della repo pubblica). Passare un solo valore (es. --kmers 13) "
-                              "per replicare il regime single-k del paper (Fig. 2a, sez. Best Hyperparameters).")
+                        help="Kernel size(s) for k-mer aggregation (e.g., --kmers 13)")
     parser.add_argument("--suffix", type=str, default="",
-                         help="Suffisso esplicito per checkpoint (es. _nmute40, _k13). Ha priorita' "
-                              "sull'auto-derivazione da --kmers: usalo sempre quando cambi SOLO nmute "
-                              "(o qualsiasi parametro diverso da kmers), altrimenti il checkpoint "
-                              "sovrascrive quello del run standard perche' il nome dipenderebbe solo da kmers.")
+                        help="Checkpoint filename suffix (e.g., _k13_nmute40)")
     parser.add_argument("--top_k_swa", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2020)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"],
-                         help="bf16 e' piu' stabile su sequenze lunghe (task virale/anellovirus, L_tot=1485) se la GPU lo supporta")
+                        help="AMP precision format")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -212,17 +206,16 @@ def main():
 
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
 
-    # 1. Split e dataframe via data_utils
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, seed=args.seed)
 
-    # 2. Dropout differenziato per config (fedele al design A/B/C/D originale)
     dropout_map = {"A": 0.25, "B": 0.2, "C": 0.1, "D": 0.5}
     drop = dropout_map[args.config]
 
     is_ce = (args.config == "C")
     nclass = 2 if is_ce else 1
 
-    # 3. Dataset
+    actual_nmute = min(args.nmute, max(1, math.floor(0.13 * seq_len))) if (is_ce and args.nmute > 0) else 0
+
     train_ds = SequenceClassificationDataset(
         train_df["sequence"].tolist(), train_df["label"].tolist(),
         arch="nucleictransformer", target_len=seq_len, config=args.config, is_train=True
@@ -232,10 +225,7 @@ def main():
         arch="nucleictransformer", target_len=seq_len, config=args.config, is_train=False
     )
 
-    # 4. Sampler pesato SOLO per Config C su task fortemente sbilanciati (viral/anellovirus)
-    #    Evita la gradient starvation: con batch=24 e ~2% di positivi, la probabilita'
-    #    che un batch non contenga alcun positivo e' ~62%, il che porta il modello
-    #    a collassare nel minimo banale (predire sempre negativo).
+    # Weighted sampler to prevent gradient starvation under severe class imbalance
     num_pos = float(train_df["label"].sum())
     num_neg = float(len(train_df) - num_pos)
     imbalance_ratio = num_neg / max(1.0, num_pos)
@@ -250,56 +240,48 @@ def main():
             replacement=True
         )
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
-                                   num_workers=2, pin_memory=True)
+                                  num_workers=2, pin_memory=torch.cuda.is_available())
     else:
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                                   num_workers=2, pin_memory=True)
+                                  num_workers=2, pin_memory=torch.cuda.is_available())
 
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False,
+                            num_workers=2, pin_memory=torch.cuda.is_available())
 
     default_epochs = {"A": 120, "B": 30, "C": 100, "D": 30}[args.config]
     total_epochs = args.epochs if args.epochs is not None else default_epochs
 
     print(f"[i] Training Nucleic Transformer | Task: '{args.task}' | Config: '{args.config}' | "
-          f"Loss: {'CrossEntropy (2 classes)' if is_ce else 'Binary'} | Input: {seq_len} bp | "
-          f"Train: {len(train_ds)} | Val: {len(val_ds)} | nmute: {args.nmute if is_ce else 0} | "
-          f"kmers: {args.kmers} | suffix: '{args.suffix}' | epochs: {total_epochs} | dropout: {drop} | "
-          f"weighted_sampler: {use_weighted_sampler} | top_k_swa: {args.top_k_swa} | AMP dtype: {args.amp_dtype}")
+          f"Loss: {'CrossEntropy (2 classes)' if is_ce else 'Binary BCE'} | Input: {seq_len} bp | "
+          f"Train: {len(train_ds)} | Val: {len(val_ds)} | nmute: {actual_nmute} | "
+          f"kmers: {args.kmers} | suffix: '{args.suffix}' | epochs: {total_epochs} | "
+          f"dropout: {drop} | weighted_sampler: {use_weighted_sampler} | AMP: {args.amp_dtype}")
 
-    # 5. Modello
     model = NucleicTransformer(
         ntoken=4, nclass=nclass, ninp=512, nhead=8, nhid=2048, nlayers=6,
         kmer_aggregation=True, kmers=args.kmers, dropout=drop,
         max_len=max(2000, seq_len * 6)
     ).to(device)
 
-    # 6. Ottimizzatori, scheduler, loss
     total_steps = len(train_loader) * total_epochs
-    custom_scheduler = False
     warmup_plateau = None
 
     if args.config == "A":
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.05), num_training_steps=total_steps)
-        # Alpha dinamico in base allo sbilanciamento del task, con tetto abbassato
-        # (0.90 invece di 0.95) per ridurre il rischio di overflow FP16 su viral.
         alpha = min(0.90, max(0.5, imbalance_ratio / (imbalance_ratio + 1.0)))
         criterion = BinaryFocalLoss(alpha=alpha, gamma=2.0)
     elif args.config == "B":
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.0)
-        # Warmup lineare (~1 epoca) prima di passare a ReduceLROnPlateau: senza questo,
-        # il Post-LN transformer collassa a AUC 0.5 fin dall'epoca 1 (visto nei log).
         warmup_steps_b = min(len(train_loader), 2000)
         warmup_plateau = WarmupThenPlateau(
             optimizer, base_lr=1e-3, warmup_steps=warmup_steps_b,
             plateau_kwargs=dict(mode="max", factor=0.5, patience=3)
         )
-        custom_scheduler = True
         criterion = nn.BCEWithLogitsLoss()
     elif args.config == "C":
         optimizer = torch.optim.Adam(model.parameters(), lr=0.0, weight_decay=0.0)
         aiayn_sched = lr_AIAYN(optimizer, d_model=512, warmup_steps=3200, factor=0.1)
-        custom_scheduler = True
         criterion = nn.CrossEntropyLoss()
     elif args.config == "D":
         optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
@@ -313,18 +295,17 @@ def main():
     patience = 15 if args.config in ["A", "C"] else 30
     patience_counter = 0
 
-    # 7. Training loop
     for epoch in range(1, total_epochs + 1):
         model.train()
         total_loss = 0.0
         steps = 0
 
         for batch in train_loader:
-            x = batch["data"].to(device)
-            y = batch["label"].to(device)
+            x = batch["data"].to(device, non_blocking=True)
+            y = batch["label"].to(device, non_blocking=True)
 
-            if is_ce and args.nmute > 0:
-                x = mutate_dna_sequence(x, args.nmute)
+            if is_ce and actual_nmute > 0:
+                x = mutate_dna_sequence(x, actual_nmute)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -374,26 +355,22 @@ def main():
             patience_counter += 1
 
         if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch}.")
+            print(f"Early stopping triggered at epoch {epoch}.")
             break
 
-    # 8. Model Soup / SWA
-    # --suffix esplicito ha priorita': usalo sempre per isolare un run di ablazione
-    # che cambia un parametro diverso da kmers (es. nmute), altrimenti il nome
-    # verrebbe derivato solo da kmers e un run con --nmute 40 (kmers di default)
-    # sovrascriverebbe silenziosamente il checkpoint del run standard con nmute=18.
+    # Model Soup averaging over top-k checkpoints
     if args.suffix:
         ckpt_suffix = args.suffix if args.suffix.startswith("_") else f"_{args.suffix}"
     else:
         kmers_tag = "-".join(str(k) for k in args.kmers)
-        default_kmers_tag = "2-3-4-5-6"
-        ckpt_suffix = "" if kmers_tag == default_kmers_tag else f"_k{kmers_tag}"
+        ckpt_suffix = "" if kmers_tag == "2-3-4-5-6" else f"_k{kmers_tag}"
+
     out_ckpt = os.path.join(args.checkpoint_dir, f"best_nucleictransformer_{args.task}_{args.config}{ckpt_suffix}.pt")
 
     if saved_checkpoints:
-        print(f"\n[i] Calcolo Weight Averaging (Model Soup) sui migliori {len(saved_checkpoints)} checkpoint:")
+        print(f"\n[i] Computing Model Soup (Weight Averaging) over top {len(saved_checkpoints)} checkpoints:")
         for idx, (score, ep, _) in enumerate(saved_checkpoints):
-            print(f"   -> Top {idx+1}: Epoca {ep:03d} (Val AUC: {score:.4f})")
+            print(f"   -> Top {idx+1}: Epoch {ep:03d} (Val AUC: {score:.4f})")
 
         soup_state = copy.deepcopy(saved_checkpoints[0][2])
         for key in soup_state.keys():
@@ -402,10 +379,10 @@ def main():
             soup_state[key] = soup_state[key] / float(len(saved_checkpoints))
 
         torch.save(soup_state, out_ckpt)
-        print(f"[v] Checkpoint Model Soup salvato: {out_ckpt} (Peak Val AUC: {best_val_auc:.4f})")
+        print(f"[✓] Model Soup checkpoint saved: {out_ckpt} (Peak Val AUC: {best_val_auc:.4f})")
     else:
         torch.save(model.state_dict(), out_ckpt)
-        print(f"[!] Nessun checkpoint qualificato (>0.55). Salvato ultimo stato in: {out_ckpt}")
+        print(f"[!] No checkpoint passed the >0.55 threshold. Saved final state: {out_ckpt}")
 
 
 if __name__ == "__main__":

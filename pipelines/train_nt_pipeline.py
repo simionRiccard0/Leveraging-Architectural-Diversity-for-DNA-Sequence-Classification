@@ -2,220 +2,442 @@
 # -*- coding: utf-8 -*-
 
 """
-Integrated training and cascade evaluation pipeline for Nucleic Transformer.
-Fixed: Dynamic Class Weighting & Correct Noam (AIAYN) lr_scale.
+Integrated training and cascade evaluation pipeline for Nucleic Transformer across Configs A, B, C, D.
+Includes AMP support, Model Soup (SWA), dynamic mutation scaling, and unified logit export.
 """
 
-import argparse
-import math
 import os
 import sys
+import copy
+import math
+import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, matthews_corrcoef
 
 from models.nucleic_transformer import NucleicTransformer
-from utils.data_utils import seed_everything, resolve_task_splits, load_seq_label_dataframe, SequenceClassificationDataset
+from utils.data_utils import resolve_task_splits, load_seq_label_dataframe, SequenceClassificationDataset
 
+
+# -----------------------------------------------------------------------------
+# Loss Functions
+# -----------------------------------------------------------------------------
 
 class BinaryFocalLoss(nn.Module):
+    """Numerically stable binary focal loss computed in FP32."""
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0, smoothing: float = 0.05):
         super().__init__()
-        self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smoothing = smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        logits = logits.view(-1)
-        targets = targets.view(-1)
-        targets_smooth = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+        logits = logits.float().view(-1)
+        targets = targets.float().view(-1)
+
+        targets_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
         bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction="none")
         probs = torch.sigmoid(logits)
-        p_t = targets * probs + (1 - targets) * (1 - probs)
-        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
-        return (alpha_t * ((1 - p_t) ** self.gamma) * bce).mean()
+
+        p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
+        alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+        modulating_factor = (1.0 - p_t).clamp(min=0.0, max=1.0) ** self.gamma
+
+        return (alpha_t * modulating_factor * bce).mean()
 
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+# -----------------------------------------------------------------------------
+# Learning Rate Schedulers
+# -----------------------------------------------------------------------------
+
+class lr_AIAYN:
+    """Noam inverse-square-root schedule for Config C."""
+    def __init__(self, optimizer, d_model: int = 512, warmup_steps: int = 3200, factor: float = 0.1):
+        self.optimizer = optimizer
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        self.factor = factor
+        self.step_num = 0
+
+    def step(self):
+        self.step_num += 1
+        lr = (self.d_model ** -0.5) * min(
+            self.step_num ** -0.5,
+            self.step_num * (self.warmup_steps ** -1.5)
+        ) * self.factor
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        return lr
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: float = 0.5):
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def evaluate_model(model, dataloader, is_ce, device):
+class WarmupThenPlateau:
+    """Linear warmup followed by ReduceLROnPlateau for Config B Post-LN stability."""
+    def __init__(self, optimizer, base_lr: float, warmup_steps: int, plateau_kwargs: dict):
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.warmup_steps = max(1, warmup_steps)
+        self.step_num = 0
+        self.warmup_done = False
+        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, **plateau_kwargs)
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = 0.0
+
+    def step_batch(self):
+        if self.step_num < self.warmup_steps:
+            self.step_num += 1
+            lr = self.base_lr * (self.step_num / self.warmup_steps)
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = lr
+        else:
+            self.warmup_done = True
+
+    def step_epoch(self, val_metric: float):
+        if self.warmup_done:
+            self.plateau.step(val_metric)
+
+
+# -----------------------------------------------------------------------------
+# Data Augmentation
+# -----------------------------------------------------------------------------
+
+def mutate_dna_sequence(sequences: torch.Tensor, nmute: int) -> torch.Tensor:
+    """Stochastic nucleotide mutation applied only in Config C."""
+    if nmute <= 0:
+        return sequences
+    mutated = sequences.clone()
+    B, L = mutated.shape
+    nmute = min(nmute, L - 1)
+
+    for i in range(B):
+        mute_indices = torch.randperm(L, device=sequences.device)[:nmute]
+        random_tokens = torch.randint(0, 4, (nmute,), dtype=mutated.dtype, device=sequences.device)
+        mutated[i, mute_indices] = random_tokens
+    return mutated
+
+
+# -----------------------------------------------------------------------------
+# Validation & Inference Helper
+# -----------------------------------------------------------------------------
+
+def evaluate(model, dataloader, device, is_ce: bool, amp_dtype: torch.dtype, return_logits: bool = False):
     model.eval()
-    all_logits, all_targets = [], []
+    all_preds = []
+    all_targets = []
+    all_logits = []
+
     with torch.no_grad():
         for batch in dataloader:
-            src = batch["data"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True)
-            out = model(src)
-            logits_val = (out[:, 1] - out[:, 0]) if is_ce else out.view(-1)
-            all_logits.extend(logits_val.cpu().numpy().flatten())
-            all_targets.extend(labels.cpu().numpy().flatten())
+            x = batch["data"].to(device, non_blocking=True)
+            y = batch["label"].to(device, non_blocking=True)
 
-    logits_arr = np.nan_to_num(np.array(all_logits), nan=0.0)
-    targets_arr = np.array(all_targets).astype(int)
-    probs_arr = 1.0 / (1.0 + np.exp(-np.clip(logits_arr, -50.0, 50.0)))
+            with torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
+                logits = model(x)
+                if is_ce:
+                    probs = torch.softmax(logits.float(), dim=-1)[:, 1]
+                    raw = logits.float()[:, 1] - logits.float()[:, 0]
+                else:
+                    probs = torch.sigmoid(logits.float().view(-1))
+                    raw = logits.float().view(-1)
 
-    auc = roc_auc_score(targets_arr, probs_arr) if len(np.unique(targets_arr)) > 1 else 0.5
-    prc = average_precision_score(targets_arr, probs_arr) if len(np.unique(targets_arr)) > 1 else 0.0
-    mcc = matthews_corrcoef(targets_arr, (probs_arr >= 0.5).astype(int)) if len(np.unique(targets_arr)) > 1 else 0.0
-    return auc, prc, mcc, logits_arr
+            all_preds.extend(probs.cpu().numpy().flatten())
+            all_targets.extend(y.cpu().numpy().flatten())
+            all_logits.extend(raw.cpu().numpy().flatten())
 
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    all_logits = np.array(all_logits)
+
+    if len(np.unique(all_targets)) < 2 or np.isnan(all_preds).any():
+        if return_logits:
+            return 0.5, 0.0, 0.0, all_logits
+        return 0.5, 0.0, 0.0
+
+    auc_score = roc_auc_score(all_targets, all_preds)
+    precision, recall, _ = precision_recall_curve(all_targets, all_preds)
+    prc_score = auc(recall, precision)
+    binary_preds = (all_preds >= 0.5).astype(int)
+    mcc_score = matthews_corrcoef(all_targets, binary_preds)
+
+    if return_logits:
+        return auc_score, prc_score, mcc_score, all_logits
+    return auc_score, prc_score, mcc_score
+
+
+# -----------------------------------------------------------------------------
+# Main Execution
+# -----------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Nucleic Transformer Training & Cascade Pipeline")
+    parser = argparse.ArgumentParser(description="Integrated Pipeline for Nucleic Transformer")
+    parser.add_argument("--task", type=str, required=True, choices=["viral", "anellovirus", "ecoli", "enhancer"])
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
-    parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
-    parser.add_argument("--checkpoint_dir", default="./checkpoints")
-    parser.add_argument("--logits_dir", default="./global_logits_monolithic")
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"),
+                        help="Root dataset directory (default: './datasets' or $DATA_DIR)")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
+    parser.add_argument("--logits_dir", type=str, default="./global_logits_monolithic",
+                        help="Prediction export directory (default: './global_logits_monolithic')")
+    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override default epochs (A:120, B:30, C:100, D:30)")
+    parser.add_argument("--nmute", type=int, default=40,
+                        help="Mutation upper bound (dynamically capped at 0.13 * L)")
+    parser.add_argument("--kmers", type=int, nargs="+", default=[2, 3, 4, 5, 6],
+                        help="Kernel size(s) for k-mer aggregation (e.g., --kmers 13)")
+    parser.add_argument("--suffix", type=str, default="",
+                        help="Checkpoint and logit filename suffix (e.g., _k13_nmute40)")
+    parser.add_argument("--top_k_swa", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2020)
+    parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"],
+                        help="AMP precision format")
     args = parser.parse_args()
 
-    seed_everything(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(args.logits_dir, exist_ok=True)
 
-    config_map = {
-        "A": {"epochs": 120, "early_stop": True, "patience": 15, "loss": "focal", "opt": "adamw", "sched": "cosine", "drop": 0.25, "out": 1},
-        "B": {"epochs": 30, "early_stop": False, "patience": 0, "loss": "bce", "opt": "adam", "sched": "step", "drop": 0.2, "out": 1},
-        "C": {"epochs": 60, "early_stop": False, "patience": 0, "loss": "ce", "opt": "adam", "sched": "aiayn", "drop": 0.1, "out": 2},
-        "D": {"epochs": 20, "early_stop": True, "patience": 8, "loss": "ce", "opt": "adamw", "sched": "warmup_cosine", "drop": 0.5, "out": 2},
-    }
-    cfg = config_map[args.config]
-    is_ce = (args.config in ["C", "D"])
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
 
-    train_df, val_df, seq_len, cascade_dict = resolve_task_splits(args.task, args.data_folder, args.seed)
-    print(f"[i] Nucleic Transformer Pipeline | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | Length: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
+    train_df, val_df, seq_len, cascade_dict = resolve_task_splits(args.task, args.data_folder, seed=args.seed)
 
-    # Calcolo pesi di bilanciamento per dataset imbilanciati (es. ViraMiner)
+    dropout_map = {"A": 0.25, "B": 0.2, "C": 0.1, "D": 0.5}
+    drop = dropout_map[args.config]
+
+    is_ce = (args.config == "C")
+    nclass = 2 if is_ce else 1
+
+    actual_nmute = min(args.nmute, max(1, math.floor(0.13 * seq_len))) if (is_ce and args.nmute > 0) else 0
+
+    train_ds = SequenceClassificationDataset(
+        train_df["sequence"].tolist(), train_df["label"].tolist(),
+        arch="nucleictransformer", target_len=seq_len, config=args.config, is_train=True
+    )
+    val_ds = SequenceClassificationDataset(
+        val_df["sequence"].tolist(), val_df["label"].tolist(),
+        arch="nucleictransformer", target_len=seq_len, config=args.config, is_train=False
+    )
+
+    # Weighted sampler to prevent gradient starvation under heavy class imbalance in Config C
     num_pos = float(train_df["label"].sum())
     num_neg = float(len(train_df) - num_pos)
-    pos_weight_ratio = num_neg / max(1.0, num_pos)
+    imbalance_ratio = num_neg / max(1.0, num_pos)
+    use_weighted_sampler = is_ce and imbalance_ratio > 5.0
 
-    tr_ds = SequenceClassificationDataset(train_df["sequence"].tolist(), train_df["label"].tolist(), "nucleictransformer", seq_len, args.config, is_train=True)
-    val_ds = SequenceClassificationDataset(val_df["sequence"].tolist(), val_df["label"].tolist(), "nucleictransformer", seq_len, args.config, is_train=False)
+    if use_weighted_sampler:
+        labels_arr = train_df["label"].to_numpy()
+        class_sample_weight = np.where(labels_arr > 0.5, num_neg / max(1.0, num_pos), 1.0)
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(class_sample_weight, dtype=torch.double),
+            num_samples=len(train_ds),
+            replacement=True
+        )
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
+                                  num_workers=2, pin_memory=torch.cuda.is_available())
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=2, pin_memory=torch.cuda.is_available())
 
-    tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False,
+                            num_workers=2, pin_memory=torch.cuda.is_available())
+
+    default_epochs = {"A": 120, "B": 30, "C": 100, "D": 30}[args.config]
+    total_epochs = args.epochs if args.epochs is not None else default_epochs
+
+    print(f"[i] Training Nucleic Transformer | Task: '{args.task}' | Config: '{args.config}' | "
+          f"Loss: {'CrossEntropy (2 classes)' if is_ce else 'Binary BCE'} | Input: {seq_len} bp | "
+          f"Train: {len(train_ds)} | Val: {len(val_ds)} | nmute: {actual_nmute} | "
+          f"kmers: {args.kmers} | suffix: '{args.suffix}' | epochs: {total_epochs} | "
+          f"dropout: {drop} | weighted_sampler: {use_weighted_sampler} | AMP: {args.amp_dtype}")
 
     model = NucleicTransformer(
-        ntoken=4,
-        nclass=cfg["out"],
-        ninp=512,
-        nhead=8,
-        nhid=2048,
-        nlayers=6,
-        kmer_aggregation=True,
-        kmers=[2, 3, 4, 5, 6],
-        dropout=cfg["drop"],
-        max_len=max(2000, seq_len + 100)
+        ntoken=4, nclass=nclass, ninp=512, nhead=8, nhid=2048, nlayers=6,
+        kmer_aggregation=True, kmers=args.kmers, dropout=drop,
+        max_len=max(2000, seq_len * 6)
     ).to(device)
 
-    # Definizione Loss pesata
-    if cfg["loss"] == "focal":
-        alpha = min(0.95, max(0.5, pos_weight_ratio / (pos_weight_ratio + 1.0)))
+    total_steps = len(train_loader) * total_epochs
+    warmup_plateau = None
+
+    if args.config == "A":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.05), num_training_steps=total_steps)
+        alpha = min(0.90, max(0.5, imbalance_ratio / (imbalance_ratio + 1.0)))
         criterion = BinaryFocalLoss(alpha=alpha, gamma=2.0)
-    elif cfg["loss"] == "bce":
-        pos_weight_t = torch.tensor([pos_weight_ratio], device=device).float()
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
-    else:
-        class_weights = torch.tensor([1.0, pos_weight_ratio], device=device).float()
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-    total_steps = len(tr_loader) * cfg["epochs"]
-
-    if cfg["opt"] == "adamw":
-        wd = 0.05 if args.config == "D" else 1e-4
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=wd)
-    else:
-        lr_base = 0.001 if args.config == "B" else 1.0
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr_base)
-
-    # Scheduler con Noam scaling corretto
-    if cfg["sched"] == "cosine":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5)))
+    elif args.config == "B":
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.0)
+        warmup_steps_b = min(len(train_loader), 2000)
+        warmup_plateau = WarmupThenPlateau(
+            optimizer, base_lr=1e-3, warmup_steps=warmup_steps_b,
+            plateau_kwargs=dict(mode="max", factor=0.5, patience=3)
         )
-    elif cfg["sched"] == "warmup_cosine":
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps
-        )
-    elif cfg["sched"] == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-    else:
-        d_model = 512
-        warmup_steps = 3200
-        lr_scale = 0.1
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lambda s: lr_scale * (d_model ** -0.5) * min(max(1, s) ** -0.5, max(1, s) * (warmup_steps ** -1.5))
-        )
+        criterion = nn.BCEWithLogitsLoss()
+    elif args.config == "C":
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0, weight_decay=0.0)
+        aiayn_sched = lr_AIAYN(optimizer, d_model=512, warmup_steps=3200, factor=0.1)
+        criterion = nn.CrossEntropyLoss()
+    elif args.config == "D":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.05), num_training_steps=total_steps)
+        criterion = nn.BCEWithLogitsLoss()
 
-    best_auc, patience_cnt = 0.0, 0
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    best_path = os.path.join(args.checkpoint_dir, f"best_nucleictransformer_{args.task}_{args.config}.pt")
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16))
 
-    for epoch in range(1, cfg["epochs"] + 1):
+    saved_checkpoints = []
+    best_val_auc = -1.0
+    patience = 15 if args.config in ["A", "C"] else 30
+    patience_counter = 0
+
+    for epoch in range(1, total_epochs + 1):
         model.train()
         total_loss = 0.0
-        for batch in tr_loader:
+        steps = 0
+
+        for batch in train_loader:
+            x = batch["data"].to(device, non_blocking=True)
+            y = batch["label"].to(device, non_blocking=True)
+
+            if is_ce and actual_nmute > 0:
+                x = mutate_dna_sequence(x, actual_nmute)
+
             optimizer.zero_grad(set_to_none=True)
-            src = batch["data"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True)
 
-            output = model(src)
-            loss = criterion(output, labels.view(-1).long() if is_ce else labels.view(-1).float())
-            loss.backward()
+            with torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
+                logits = model(x)
+                if is_ce:
+                    loss = criterion(logits.float(), y.long().view(-1))
+                else:
+                    loss = criterion(logits.float().view(-1), y.float().view(-1))
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if args.config == "D" else 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
-            if cfg["sched"] in ["aiayn", "warmup_cosine"]:
+            if args.config == "C":
+                aiayn_sched.step()
+            elif args.config == "B":
+                warmup_plateau.step_batch()
+            elif args.config in ["A", "D"]:
                 scheduler.step()
-            total_loss += loss.item() * len(src)
 
-        if cfg["sched"] not in ["aiayn", "warmup_cosine"]:
-            scheduler.step()
+            total_loss += loss.item() if not math.isnan(loss.item()) else 0.0
+            steps += 1
 
-        val_auc, val_prc, val_mcc, _ = evaluate_model(model, val_loader, is_ce, device)
-        print(f"Epoch {epoch:03d}/{cfg['epochs']:03d} | Loss: {total_loss/len(tr_ds):.4f} | Val AUC: {val_auc:.4f} | Val PRC: {val_prc:.4f} | Val MCC: {val_mcc:.4f}")
+        train_loss = total_loss / max(steps, 1)
+        val_auc, val_prc, val_mcc = evaluate(model, val_loader, device, is_ce=is_ce, amp_dtype=amp_dtype)
 
-        if val_auc > best_auc:
-            best_auc = val_auc
-            patience_cnt = 0
-            torch.save({"model_state_dict": model.state_dict(), "epoch": epoch, "val_auc": val_auc}, best_path)
+        if args.config == "B":
+            warmup_plateau.step_epoch(val_auc)
+
+        print(f"Epoch {epoch:03d}/{total_epochs:03d} | Train Loss: {train_loss:.4f} | "
+              f"Val AUC: {val_auc:.4f} | Val PRC: {val_prc:.4f} | Val MCC: {val_mcc:.4f}")
+
+        if val_auc > 0.55:
+            state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+            saved_checkpoints.append((val_auc, epoch, state_dict_cpu))
+            saved_checkpoints.sort(key=lambda item: item[0], reverse=True)
+            if len(saved_checkpoints) > args.top_k_swa:
+                saved_checkpoints.pop()
+
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            patience_counter = 0
         else:
-            patience_cnt += 1
-            if cfg["early_stop"] and patience_cnt >= cfg["patience"]:
-                print(f"Early stopping at epoch {epoch}.")
-                break
+            patience_counter += 1
 
-    print(f"\nTraining complete. Best Checkpoint: {best_path} (AUC: {best_auc:.4f})")
-    model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch}.")
+            break
 
-    os.makedirs(args.logits_dir, exist_ok=True)
+    # Model Soup averaging over top-k checkpoints
+    if args.suffix:
+        ckpt_suffix = args.suffix if args.suffix.startswith("_") else f"_{args.suffix}"
+    else:
+        kmers_tag = "-".join(str(k) for k in args.kmers)
+        ckpt_suffix = "" if kmers_tag == "2-3-4-5-6" else f"_k{kmers_tag}"
+
+    out_ckpt = os.path.join(args.checkpoint_dir, f"best_nucleictransformer_{args.task}_{args.config}{ckpt_suffix}.pt")
+
+    if saved_checkpoints:
+        print(f"\n[i] Computing Model Soup (Weight Averaging) over top {len(saved_checkpoints)} checkpoints:")
+        for idx, (score, ep, _) in enumerate(saved_checkpoints):
+            print(f"   -> Top {idx+1}: Epoch {ep:03d} (Val AUC: {score:.4f})")
+
+        soup_state = copy.deepcopy(saved_checkpoints[0][2])
+        for key in soup_state.keys():
+            for i in range(1, len(saved_checkpoints)):
+                soup_state[key] += saved_checkpoints[i][2][key]
+            soup_state[key] = soup_state[key] / float(len(saved_checkpoints))
+
+        torch.save(soup_state, out_ckpt)
+        print(f" Model Soup checkpoint saved: {out_ckpt} (Peak Val AUC: {best_val_auc:.4f})")
+    else:
+        torch.save(model.state_dict(), out_ckpt)
+        print(f"[!] No checkpoint passed the >0.55 threshold. Saved final state: {out_ckpt}")
+
+    # Cascade Evaluation
+    model.load_state_dict(torch.load(out_ckpt, map_location=device))
     print("\n--- Running Cascade Evaluation ---")
+
     for d_name, d_path in cascade_dict.items():
         if not os.path.exists(d_path):
             continue
-        eval_df = load_seq_label_dataframe(d_path)
-        eval_ds = SequenceClassificationDataset(eval_df["sequence"].tolist(), eval_df["label"].tolist(), "nucleictransformer", seq_len, args.config, is_train=False)
-        eval_loader = DataLoader(eval_ds, batch_size=args.batch_size * 2, shuffle=False)
 
-        auc, prc, mcc, raw_logits = evaluate_model(model, eval_loader, is_ce, device)
-        print(f" -> [{d_name}] AUROC: {auc:.4f} | AUPRC: {prc:.4f} | MCC: {mcc:.4f}")
-        out_fpath = os.path.join(args.logits_dir, f"nucleictransformer_cfg{args.config}_{args.task}_{d_name}.txt")
+        eval_df = load_seq_label_dataframe(d_path)
+        eval_ds = SequenceClassificationDataset(
+            eval_df["sequence"].tolist(),
+            eval_df["label"].tolist(),
+            arch="nucleictransformer",
+            target_len=seq_len,
+            config=args.config,
+            is_train=False
+        )
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=args.batch_size * 2,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=torch.cuda.is_available()
+        )
+
+        eval_auc, eval_prc, eval_mcc, raw_logits = evaluate(
+            model,
+            eval_loader,
+            device,
+            is_ce=is_ce,
+            amp_dtype=amp_dtype,
+            return_logits=True
+        )
+
+        print(f" [{d_name}] AUROC: {eval_auc:.4f} | AUPRC: {eval_prc:.4f} | MCC: {eval_mcc:.4f}")
+
+        out_fname = f"nucleictransformer_cfg{args.config}{ckpt_suffix}_{args.task}_{d_name}.txt"
+        out_fpath = os.path.join(args.logits_dir, out_fname)
         np.savetxt(out_fpath, raw_logits, fmt="%.6f")
         print(f"    Logits saved: {out_fpath}")
+
+    print("\n Nucleic Transformer pipeline completed successfully.")
 
 
 if __name__ == "__main__":

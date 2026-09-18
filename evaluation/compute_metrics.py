@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Post-hoc Performance Evaluation and Modular vs Monolithic Analysis.
+Computes AUROC, AUPRC, MCC, Balanced Accuracy, F1, and Inter-Architectural Soft Voting Ensembles.
+"""
+
 import os
 import glob
 import re
@@ -24,12 +32,6 @@ pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 25)
 pd.set_option('display.width', 1000)
 
-DATA_DIRS = [
-    os.environ.get("DATA_DIR", "./datasets"),
-    "./datasets",
-    "../datasets"
-]
-
 PRIMARY_TESTS = ["test_ecoli", "test_enhancer", "test_anellovirus", "test_VM"]
 
 PRIMARY_TASK_NAMES = {
@@ -48,57 +50,83 @@ ARCH_LABELS = {
 
 LABEL_CACHE = {}
 
-def get_valid_data_root():
-    for d in DATA_DIRS:
-        if os.path.exists(d):
-            return d
-    return DATA_DIRS[0]
 
-DATA_ROOT = get_valid_data_root()
+def resolve_data_root(custom_dir: str = None) -> str:
+    """Detects a valid dataset directory using CLI arguments, ENV variables, or relative paths."""
+    candidates = [
+        custom_dir,
+        os.environ.get("DATA_DIR"),
+        "./datasets",
+        "../datasets",
+        "../../datasets"
+    ]
+    for d in candidates:
+        if d and os.path.exists(d) and os.path.isdir(d):
+            return os.path.abspath(d)
+    return os.path.abspath(custom_dir if custom_dir else "./datasets")
 
-def sigmoid(z):
+
+def sigmoid(z: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(z, -50.0, 50.0)))
 
-def find_dataset_file(test_set_name):
-    """Locate test set CSV files using structured and recursive lookup."""
+
+def find_dataset_file(test_set_name: str, data_root: str) -> str:
+    """Locate test set CSV files using structured lookup and recursive fallback."""
     direct_candidates = [
         # E. coli
-        os.path.join(DATA_ROOT, "ecoli", "test_ecoli.csv"),
-        os.path.join(DATA_ROOT, "ecoli", "ecoli_independent_test_NT.csv"),
+        os.path.join(data_root, "ecoli", "test_ecoli.csv"),
+        os.path.join(data_root, "ecoli", "ecoli_independent_test_NT.csv"),
+        os.path.join(data_root, "ecoli", "ecoli_test_NT.csv"),
+        os.path.join(data_root, "ecoli_independent_test_NT.csv"),
+        os.path.join(data_root, "ecoli_test_NT.csv"),
+
         # Enhancer
-        os.path.join(DATA_ROOT, "enhancer", "test_enhancer.csv"),
-        os.path.join(DATA_ROOT, "enhancer", "bert_enhancer_ind_test_set.csv"),
+        os.path.join(data_root, "enhancer", "test_enhancer.csv"),
+        os.path.join(data_root, "enhancer", "bert_enhancer_ind_test_set.csv"),
+        os.path.join(data_root, "enhancer", "bert_enhancer_test.csv"),
+        os.path.join(data_root, "bert_enhancer_ind_test_set.csv"),
+        os.path.join(data_root, "bert_enhancer_test.csv"),
+
         # Anellovirus
-        os.path.join(DATA_ROOT, "anellovirus", "test_anellovirus.csv"),
-        os.path.join(DATA_ROOT, "unseen_anell", "test_data_anell_300_binary.csv"),
-        os.path.join(DATA_ROOT, "anellovirus", "test_data_anell_300_binary.csv"),
+        os.path.join(data_root, "anellovirus", "test_anellovirus.csv"),
+        os.path.join(data_root, "unseen_anell", "test_data_anell_300_binary.csv"),
+        os.path.join(data_root, "anellovirus", "test_data_anell_300_binary.csv"),
+        os.path.join(data_root, "test_data_anell_300_binary.csv"),
+
         # Viral VM
-        os.path.join(DATA_ROOT, "viral", "test_VM.csv"),
-        os.path.join(DATA_ROOT, "DNA_data", "fullset_test.csv"),
-        os.path.join(DATA_ROOT, "viral", "fullset_test.csv"),
+        os.path.join(data_root, "fullset_test.csv"),
+        os.path.join(data_root, "VM", "fullset_test.csv"),
+        os.path.join(data_root, "viral", "test_VM.csv"),
+        os.path.join(data_root, "DNA_data", "fullset_test.csv"),
+        os.path.join(data_root, "viral", "fullset_test.csv"),
     ]
 
     if test_set_name == "test_ecoli":
-        for c in direct_candidates[:2]:
-            if os.path.exists(c): return c
+        for c in direct_candidates[:5]:
+            if os.path.exists(c):
+                return c
     elif test_set_name == "test_enhancer":
-        for c in direct_candidates[2:4]:
-            if os.path.exists(c): return c
+        for c in direct_candidates[5:10]:
+            if os.path.exists(c):
+                return c
     elif test_set_name == "test_anellovirus":
-        for c in direct_candidates[4:7]:
-            if os.path.exists(c): return c
+        for c in direct_candidates[10:14]:
+            if os.path.exists(c):
+                return c
     elif test_set_name == "test_VM":
-        for c in direct_candidates[7:]:
-            if os.path.exists(c): return c
+        for c in direct_candidates[14:]:
+            if os.path.exists(c):
+                return c
 
-    # Noise pattern matching (SIM benchmarks)
+    # Noise pattern matching (DS-SIM benchmarks)
     m = re.match(r"test_sim_noise_(\d+)_seed_(\d+)_fullset_test", test_set_name)
     if m:
         noise_lvl, seed = m.groups()
         noise_paths = [
-            os.path.join(DATA_ROOT, "viral", "noise_tests", f"{test_set_name}.csv"),
-            os.path.join(DATA_ROOT, "SIM", f"noise_{noise_lvl}", f"seed_{seed}", "fullset_test.csv"),
-            os.path.join(DATA_ROOT, f"noise_{noise_lvl}", f"seed_{seed}", "fullset_test.csv")
+            os.path.join(data_root, "viral", "noise_tests", f"{test_set_name}.csv"),
+            os.path.join(data_root, "SIM", f"noise_{noise_lvl}", f"seed_{seed}", "fullset_test.csv"),
+            os.path.join(data_root, f"noise_{noise_lvl}", f"seed_{seed}", "fullset_test.csv"),
+            os.path.join(data_root, "SIM", f"noise_{noise_lvl}", f"seed_{seed}.csv")
         ]
         for np_path in noise_paths:
             if os.path.exists(np_path):
@@ -106,41 +134,42 @@ def find_dataset_file(test_set_name):
 
     # Recursive glob fallback
     target_clean = test_set_name.replace("test_", "")
-    matches = glob.glob(f"{DATA_ROOT}/**/{test_set_name}.csv", recursive=True)
+    matches = glob.glob(f"{data_root}/**/{test_set_name}.csv", recursive=True)
     if matches:
         return matches[0]
-    matches_clean = glob.glob(f"{DATA_ROOT}/**/{target_clean}.csv", recursive=True)
+    matches_clean = glob.glob(f"{data_root}/**/{target_clean}.csv", recursive=True)
     if matches_clean:
         return matches_clean[0]
 
     return None
 
-def load_ground_truth(test_set_name):
-    """Load ground-truth binary labels (0/1) preserving sample indices."""
+
+def load_ground_truth(test_set_name: str, data_root: str) -> np.ndarray:
+    """Loads ground-truth binary labels (0/1) preserving sample indices."""
     if test_set_name in LABEL_CACHE:
         return LABEL_CACHE[test_set_name]
 
-    file_path = find_dataset_file(test_set_name)
+    file_path = find_dataset_file(test_set_name, data_root)
     if not file_path or not os.path.exists(file_path):
         return None
 
     try:
-        df_head = pd.read_csv(file_path)
-        first_col_name = str(df_head.columns[-1]).strip()
+        with open(file_path, "r") as fh:
+            first_line = fh.readline().strip()
+        fields = first_line.split(",")
+        has_header = not any(c.isdigit() for c in fields[-1])
 
-        if first_col_name.lower() in ['label', 'labels', 'target', 'class', 'y']:
-            labels = df_head[first_col_name].values.astype(int)
-        else:
-            df_nohead = pd.read_csv(file_path, header=None)
-            labels = df_nohead.iloc[:, -1].values.astype(int)
+        df = pd.read_csv(file_path) if has_header else pd.read_csv(file_path, header=None)
+        labels = df.iloc[:, -1].values.astype(int)
 
         LABEL_CACHE[test_set_name] = labels
         return labels
     except Exception:
         return None
 
-def safe_mcc(y_true, y_pred):
-    """Compute Matthews Correlation Coefficient with zero-division safety."""
+
+def safe_mcc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Computes Matthews Correlation Coefficient with zero-division safety."""
     if len(np.unique(y_pred)) < 2 or len(np.unique(y_true)) < 2:
         return 0.0
     try:
@@ -150,8 +179,9 @@ def safe_mcc(y_true, y_pred):
     except Exception:
         return 0.0
 
-def compute_all_metrics(y_true, y_score):
-    """Compute classification metrics with standard (0.5) and Youden's J optimal threshold."""
+
+def compute_all_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
+    """Computes classification metrics using standard (0.5) and Youden's J optimal threshold."""
     if len(np.unique(y_true)) < 2:
         return {
             "AUROC": np.nan, "AUPRC": np.nan, "MCC": np.nan, "MCC_05": np.nan,
@@ -217,7 +247,8 @@ def compute_all_metrics(y_true, y_score):
         "Best_Thresh": best_thresh
     }
 
-def analyze_directory(logits_dir, output_suffix=""):
+
+def analyze_directory(logits_dir: str, data_root: str, output_suffix: str = ""):
     files = sorted(glob.glob(os.path.join(logits_dir, "*.txt")))
     if not files:
         print(f"[!] No logit files found in '{logits_dir}'.")
@@ -234,16 +265,26 @@ def analyze_directory(logits_dir, output_suffix=""):
             continue
 
         model_name, cfg, train_task, test_set = match.groups()
-        raw_logits = np.loadtxt(f)
+        try:
+            raw_logits = np.loadtxt(f)
+        except Exception as e:
+            print(f"  [!] Impossibile leggere {fname}: {e}")
+            continue
+
         if raw_logits.ndim == 0:
             continue
         if raw_logits.ndim > 1:
             raw_logits = raw_logits[:, 0]
 
         scores = sigmoid(raw_logits)
-        labels = load_ground_truth(test_set)
+        labels = load_ground_truth(test_set, data_root)
 
-        if labels is None or len(scores) != len(labels):
+        if labels is None:
+            print(f"  [!] AVVISO: Ground-truth non trovato per '{test_set}' (file ignorato: {fname})")
+            continue
+
+        if len(scores) != len(labels):
+            print(f"  [!] ERRORE LUNGHEZZA: {fname} contiene {len(scores)} logit, ma {test_set} ha {len(labels)} campioni.")
             continue
 
         metrics = compute_all_metrics(labels, scores)
@@ -320,23 +361,27 @@ def analyze_directory(logits_dir, output_suffix=""):
 
     return combined_df, primary_df
 
+
 def main():
     parser = argparse.ArgumentParser(description="Performance Evaluation and Modular vs Monolithic Analysis")
     parser.add_argument("--dir_mod", type=str, default="global_logits", help="Modular logits directory")
     parser.add_argument("--dir_mono", type=str, default="global_logits_monolithic", help="Monolithic logits directory")
+    parser.add_argument("--data_folder", "-d", type=str, default=None,
+                        help="Root directory containing benchmark dataset CSVs (default: $DATA_DIR or ./datasets)")
     args = parser.parse_args()
 
-    print(f"[*] Identified Dataset Root: {DATA_ROOT}")
+    data_root = resolve_data_root(args.data_folder)
+    print(f"[*] Identified Dataset Root: {data_root}")
 
     # =========================================================================
     # SECTION 1: MODULAR LOGITS EVALUATION
     # =========================================================================
     print("\n" + "=" * 115)
-    print(f"{'1. MODULAR BENCHMARK EVALUATION (global_logits)':^115}")
+    print(f"{'1. MODULAR BENCHMARK EVALUATION (' + args.dir_mod + ')':^115}")
     print("=" * 115)
-    combined_mod, primary_mod = analyze_directory(args.dir_mod, output_suffix="_modular")
+    combined_mod, primary_mod = analyze_directory(args.dir_mod, data_root=data_root, output_suffix="_modular")
 
-    if primary_mod is not None:
+    if primary_mod is not None and not primary_mod.empty:
         p_disp = primary_mod.sort_values(by=["TrainTask", "TestSet", "Config", "Architecture"]).copy()
         for col in ["AUROC", "AUPRC", "MCC", "BACC", "F1"]:
             p_disp[col] = p_disp[col].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else "N/A")
@@ -346,11 +391,11 @@ def main():
     # SECTION 2: MONOLITHIC LOGITS EVALUATION
     # =========================================================================
     print("\n" + "=" * 115)
-    print(f"{'2. MONOLITHIC BENCHMARK EVALUATION (global_logits_monolithic)':^115}")
+    print(f"{'2. MONOLITHIC BENCHMARK EVALUATION (' + args.dir_mono + ')':^115}")
     print("=" * 115)
-    combined_mono, primary_mono = analyze_directory(args.dir_mono, output_suffix="_monolithic")
+    combined_mono, primary_mono = analyze_directory(args.dir_mono, data_root=data_root, output_suffix="_monolithic")
 
-    if primary_mono is not None:
+    if primary_mono is not None and not primary_mono.empty:
         p_disp_mono = primary_mono.sort_values(by=["TrainTask", "TestSet", "Config", "Architecture"]).copy()
         for col in ["AUROC", "AUPRC", "MCC", "BACC", "F1"]:
             p_disp_mono[col] = p_disp_mono[col].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else "N/A")
@@ -359,7 +404,7 @@ def main():
     # =========================================================================
     # SECTION 3: MODULAR VS MONOLITHIC COMPARISON (DELTA ANALYSIS)
     # =========================================================================
-    if primary_mod is not None and primary_mono is not None:
+    if primary_mod is not None and primary_mono is not None and not primary_mod.empty and not primary_mono.empty:
         print("\n" + "=" * 115)
         print(f"{'3. MODULAR VS MONOLITHIC COMPARISON (AUROC DELTA = MODULAR - MONOLITHIC)':^115}")
         print("=" * 115)
@@ -371,7 +416,7 @@ def main():
         )
         merged_comp["Delta_AUROC"] = merged_comp["AUROC_Modular"] - merged_comp["AUROC_Monolithic"]
         merged_comp.to_csv("paper_metrics_comparison_delta.csv", index=False)
-        
+
         comp_disp = merged_comp.sort_values(by=["TrainTask", "TestSet", "Config", "Architecture"]).copy()
         for col in ["AUROC_Modular", "AUROC_Monolithic", "Delta_AUROC"]:
             comp_disp[col] = comp_disp[col].apply(lambda x: f"{x:+.4f}" if pd.notnull(x) else "N/A")
@@ -380,7 +425,7 @@ def main():
     # =========================================================================
     # SECTION 4: SEQUENCING NOISE ROBUSTNESS
     # =========================================================================
-    if combined_mod is not None:
+    if combined_mod is not None and not combined_mod.empty:
         noise_df = combined_mod[combined_mod["TestSet"].str.contains("noise", case=False)].copy()
         if not noise_df.empty:
             noise_df["Noise_Level"] = noise_df["TestSet"].apply(
@@ -407,6 +452,7 @@ def main():
     print("    - paper_metrics_primary_modular.csv / paper_metrics_primary_monolithic.csv")
     print("    - paper_metrics_comparison_delta.csv")
     print("    - paper_metrics_noise_summary.csv")
+
 
 if __name__ == "__main__":
     main()

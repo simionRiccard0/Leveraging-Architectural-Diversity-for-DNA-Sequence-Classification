@@ -77,7 +77,10 @@ def main():
     if args.test_csv:
         cascade_dict = {"custom_test": args.test_csv}
 
-    is_ce = (args.config in ["C", "D"])
+    if args.arch == "nucleictransformer":
+        is_ce = (args.config == "C")
+    else:
+        is_ce = (args.config in ["C", "D"])
     num_classes = 2 if is_ce else 1
     is_dnabert = (args.arch == "dnabert2camp")
     is_fulle = (args.arch == "fulle")
