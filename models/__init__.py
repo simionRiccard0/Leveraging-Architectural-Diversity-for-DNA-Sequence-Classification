@@ -7,7 +7,6 @@ from .fulle import FullE10Ensemble, FullEBranch, FullEMerger
 from .nucleic_transformer import NucleicTransformer
 from .model_3dcv import Model3DCV
 from .helix_cnn import HelixCNN
-from .capsnet_2d import CapsEnhancerModel
 
 
 FullEEnsemble = FullE10Ensemble
@@ -24,7 +23,6 @@ try:
         "DNABERT2CAMP",
         "Model3DCV",
         "HelixCNN",
-        "CapsEnhancerModel",
     ]
 except ImportError:
     __all__ = [
@@ -36,5 +34,4 @@ except ImportError:
         "NucleicTransformer",
         "Model3DCV",
         "HelixCNN",
-        "CapsEnhancerModel",
     ]
