@@ -5,8 +5,7 @@ Architectural definitions for raw DNA sequence classification models.
 from .genexplorer import GenExplorer
 from .fulle import FullE10Ensemble, FullEBranch, FullEMerger
 from .nucleic_transformer import NucleicTransformer
-from .model_3dcv import Model3DCV
-from .helix_cnn import HelixCNN
+from .sequencecnn import SequenceCNN
 
 
 FullEEnsemble = FullE10Ensemble
@@ -21,8 +20,7 @@ try:
         "FullEMerger",
         "NucleicTransformer",
         "DNABERT2CAMP",
-        "Model3DCV",
-        "HelixCNN",
+        "SequenceCNN",
     ]
 except ImportError:
     __all__ = [
@@ -32,6 +30,5 @@ except ImportError:
         "FullEBranch",
         "FullEMerger",
         "NucleicTransformer",
-        "Model3DCV",
-        "HelixCNN",
+        "SequenceCNN",
     ]
