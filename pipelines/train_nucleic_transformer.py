@@ -29,12 +29,7 @@ from models.nucleic_transformer import NucleicTransformer
 from utils.data_utils import resolve_task_splits, SequenceClassificationDataset
 
 
-# -----------------------------------------------------------------------------
-# Loss Functions
-# -----------------------------------------------------------------------------
-
 class BinaryFocalLoss(nn.Module):
-    """Numerically stable focal loss computed in FP32."""
     def __init__(self, alpha: float = 0.75, gamma: float = 2.0, smoothing: float = 0.05):
         super().__init__()
         self.alpha = alpha
@@ -56,12 +51,7 @@ class BinaryFocalLoss(nn.Module):
         return (alpha_t * modulating_factor * bce).mean()
 
 
-# -----------------------------------------------------------------------------
-# Learning Rate Schedulers
-# -----------------------------------------------------------------------------
-
 class lr_AIAYN:
-    """Noam inverse-square-root schedule for Config C."""
     def __init__(self, optimizer, d_model: int = 512, warmup_steps: int = 3200, factor: float = 0.1):
         self.optimizer = optimizer
         self.d_model = d_model
@@ -90,7 +80,6 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_traini
 
 
 class WarmupThenPlateau:
-    """Linear warmup followed by ReduceLROnPlateau for Config B Post-LN stability."""
     def __init__(self, optimizer, base_lr: float, warmup_steps: int, plateau_kwargs: dict):
         self.optimizer = optimizer
         self.base_lr = base_lr
@@ -115,12 +104,7 @@ class WarmupThenPlateau:
             self.plateau.step(val_metric)
 
 
-# -----------------------------------------------------------------------------
-# Data Augmentation
-# -----------------------------------------------------------------------------
-
 def mutate_dna_sequence(sequences: torch.Tensor, nmute: int) -> torch.Tensor:
-    """Stochastic nucleotide mutation applied only in Config C."""
     if nmute <= 0:
         return sequences
     mutated = sequences.clone()
@@ -133,10 +117,6 @@ def mutate_dna_sequence(sequences: torch.Tensor, nmute: int) -> torch.Tensor:
         mutated[i, mute_indices] = random_tokens
     return mutated
 
-
-# -----------------------------------------------------------------------------
-# Evaluation Helper
-# -----------------------------------------------------------------------------
 
 def evaluate(model, dataloader, device, is_ce: bool, amp_dtype: torch.dtype):
     model.eval()
@@ -173,13 +153,9 @@ def evaluate(model, dataloader, device, is_ce: bool, amp_dtype: torch.dtype):
     return auc_score, prc_score, mcc_score
 
 
-# -----------------------------------------------------------------------------
-# Main Execution
-# -----------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(description="Standalone Training for Nucleic Transformer")
-    parser.add_argument("--task", type=str, required=True, choices=["viral", "anellovirus", "ecoli", "enhancer"])
+    parser.add_argument("--task", type=str, required=True, choices=["viral", "anellovirus", "ecoli", "enhancer", "basith", "cohn", "modomics"])
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
     parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"),
                         help="Root dataset directory (default: './datasets' or $DATA_DIR)")
@@ -225,7 +201,6 @@ def main():
         arch="nucleictransformer", target_len=seq_len, config=args.config, is_train=False
     )
 
-    # Weighted sampler to prevent gradient starvation under severe class imbalance
     num_pos = float(train_df["label"].sum())
     num_neg = float(len(train_df) - num_pos)
     imbalance_ratio = num_neg / max(1.0, num_pos)
@@ -248,7 +223,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2, shuffle=False,
                             num_workers=2, pin_memory=torch.cuda.is_available())
 
-    default_epochs = {"A": 120, "B": 30, "C": 100, "D": 30}[args.config]
+    default_epochs = {"A": 120, "B": 30, "C": 60, "D": 30}[args.config]
     total_epochs = args.epochs if args.epochs is not None else default_epochs
 
     print(f"[i] Training Nucleic Transformer | Task: '{args.task}' | Config: '{args.config}' | "
@@ -358,7 +333,6 @@ def main():
             print(f"Early stopping triggered at epoch {epoch}.")
             break
 
-    # Model Soup averaging over top-k checkpoints
     if args.suffix:
         ckpt_suffix = args.suffix if args.suffix.startswith("_") else f"_{args.suffix}"
     else:

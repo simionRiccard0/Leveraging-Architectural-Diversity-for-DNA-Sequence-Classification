@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Standalone training script for GenExplorer.
-Supports Configurations A (C1), B (C2), C (C3), and D (C4).
-"""
-
 import argparse
 import math
 import os
-import sys
 import numpy as np
+import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.genexplorer import GenExplorer
 from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset
@@ -31,132 +24,156 @@ class BinaryFocalLoss(nn.Module):
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         logits = logits.view(-1)
         targets = targets.view(-1)
-        targets_smooth = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+        targets_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
         bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction="none")
         probs = torch.sigmoid(logits)
-        p_t = targets * probs + (1 - targets) * (1 - probs)
-        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
-        return (alpha_t * ((1 - p_t) ** self.gamma) * bce).mean()
-
-
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+        p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
+        alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+        return (alpha_t * ((1.0 - p_t) ** self.gamma) * bce).mean()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GenExplorer Training")
+    parser = argparse.ArgumentParser(description="GenExplorer Training Pipeline")
+    parser.add_argument("--epochs", type=int, default=None, help="Override default epochs")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
-    parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
+    parser.add_argument("--task", type=str, default="viral")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"))
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=2020)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--input_rep", type=str, default="onehot", choices=["onehot", "physhelical"])
+    parser.add_argument("--period_T", type=float, default=None)
+    parser.add_argument("--use_length_feature", action="store_true")
     args = parser.parse_args()
 
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    config_map = {
-        "A": {"epochs": 120, "early_stop": True, "patience": 15, "batch_size": 128, "loss": "focal", "opt": "adamw", "sched": "cosine", "drop": 0.25, "out": 1},
-        "B": {"epochs": 30, "early_stop": False, "patience": 0, "batch_size": 128, "loss": "bce", "opt": "adam", "sched": "step", "drop": 0.2, "out": 1},
-        "C": {"epochs": 60, "early_stop": False, "patience": 0, "batch_size": 128, "loss": "ce", "opt": "adam", "sched": "aiayn", "drop": 0.1, "out": 2},
-        "D": {"epochs": 20, "early_stop": True, "patience": 8, "batch_size": 128, "loss": "ce", "opt": "adamw", "sched": "warmup_cosine", "drop": 0.5, "out": 2},
-    }
-    cfg = config_map[args.config]
+    epochs_map = {"A": 120, "B": 30, "C": 60, "D": 20}
+    total_epochs = args.epochs if args.epochs is not None else epochs_map[args.config]
     is_ce = (args.config in ["C", "D"])
+    num_classes = 2 if is_ce else 1
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
-    print(f"[i] Training GenExplorer | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | Input: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
+    print(f"[i] Training GenExplorer | Task: '{args.task}' | Config: '{args.config}' (Classes: {num_classes}) | "
+          f"Rep: {args.input_rep} | Length Feature: {args.use_length_feature} | Train: {len(train_df)} | Val: {len(val_df)}")
 
-    tr_ds = SequenceClassificationDataset(train_df["sequence"].tolist(), train_df["label"].tolist(), "genexplorer", seq_len, args.config, is_train=True)
-    val_ds = SequenceClassificationDataset(val_df["sequence"].tolist(), val_df["label"].tolist(), "genexplorer", seq_len, args.config, is_train=False)
+    tr_ds = SequenceClassificationDataset(
+        train_df["sequence"].tolist(), train_df["label"].tolist(),
+        arch="genexplorer", target_len=seq_len, config=args.config, is_train=True,
+        task=args.task, input_rep=args.input_rep, period_T=args.period_T
+    )
+    val_ds = SequenceClassificationDataset(
+        val_df["sequence"].tolist(), val_df["label"].tolist(),
+        arch="genexplorer", target_len=seq_len, config=args.config, is_train=False,
+        task=args.task, input_rep=args.input_rep, period_T=args.period_T
+    )
 
-    tr_loader = DataLoader(tr_ds, batch_size=cfg["batch_size"], shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
-    val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
+    tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=torch.cuda.is_available())
 
-    model = GenExplorer(cnn_drop=cfg["drop"], trans_drop=0.1, out_features=cfg["out"], max_len=max(512, seq_len)).to(device)
-    criterion = BinaryFocalLoss() if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
-    total_steps = len(tr_loader) * cfg["epochs"]
-
-    if cfg["opt"] == "adamw":
-        trans_p = list(model.transformer.parameters())
-        other_p = list(model.pattern.parameters()) + list(model.frequency.parameters()) + list(model.fc.parameters())
-        wd = 0.05 if args.config == "D" else 1e-4
-        optimizer = torch.optim.AdamW([{"params": other_p, "lr": 1e-4}, {"params": trans_p, "lr": 5e-5}], weight_decay=wd)
-    else:
-        lr_base = 0.001 if args.config == "B" else 1.0
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr_base)
-
-    if cfg["sched"] == "cosine":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5))))
-    elif cfg["sched"] == "warmup_cosine":
-        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
-    elif cfg["sched"] == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-    else:
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: (256**-0.5) * min(max(1, s)**-0.5, max(1, s) * (4000**-1.5)))
-
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    best_path = os.path.join(args.checkpoint_dir, f"best_genexplorer_{args.task}_{args.config}.pt")
-    best_auc, patience_cnt = 0.0, 0
+    in_ch = 4
+    safe_max_len = max(2048, seq_len + 64)
+    model = GenExplorer(
+        in_channels=in_ch,
+        out_features=num_classes,
+        max_len=safe_max_len,
+        use_length_feature=args.use_length_feature
+    ).to(device)
 
     if args.config == "A":
-        for p in model.transformer.parameters():
-            p.requires_grad = False
+        criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
+        trans_p = list(model.transformer.parameters())
+        other_p = list(model.pattern.parameters()) + list(model.frequency.parameters()) + list(model.fc.parameters())
+        optimizer = torch.optim.AdamW([
+            {"params": other_p, "lr": 1e-4},
+            {"params": trans_p, "lr": 5e-5}
+        ], weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lambda ep: (ep + 1) / 5.0 if ep < 5 else 0.5 * (1.0 + math.cos(math.pi * (ep - 5) / max(1, total_epochs - 5)))
+        )
+    elif args.config == "B":
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    elif args.config == "C":
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+    else:
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
 
-    for epoch in range(1, cfg["epochs"] + 1):
-        if args.config == "A" and epoch == 6:
-            for p in model.transformer.parameters():
-                p.requires_grad = True
-            print("[i] Transformer unfreezed post-warmup.")
+    best_auc, patience_cnt = 0.0, 0
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    suffix = f"_{args.input_rep}" if args.input_rep != "onehot" else ""
+    best_path = os.path.join(args.checkpoint_dir, f"best_genexplorer_{args.task}_{args.config}{suffix}.pt")
 
+    for epoch in range(1, total_epochs + 1):
         model.train()
         total_loss = 0.0
-        for batch in tr_loader:
-            x_b, y_b = batch["data"].to(device, non_blocking=True), batch["label"].to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            out = model(x_b)
-            loss = criterion(out, y_b.view(-1).long() if is_ce else y_b.view(-1).float())
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if args.config == "D" else 1.0)
-            optimizer.step()
-            if cfg["sched"] in ["aiayn", "warmup_cosine"]:
-                scheduler.step()
-            total_loss += loss.item() * len(x_b)
 
-        if cfg["sched"] not in ["aiayn", "warmup_cosine"]:
+        for batch in tr_loader:
+            optimizer.zero_grad(set_to_none=True)
+            x_b = batch["data"].to(device, non_blocking=True)
+            y_b = batch["label"].to(device, non_blocking=True)
+            mask_b = batch.get("mask", None)
+            if mask_b is not None:
+                mask_b = mask_b.to(device, non_blocking=True)
+            len_b = batch.get("len_feat", None)
+            if len_b is not None:
+                len_b = len_b.to(device, non_blocking=True)
+
+            out = model(x_b, mask=mask_b, lengths=len_b) if mask_b is not None else model(x_b)
+            loss = criterion(out, y_b.long() if is_ce else y_b.float().unsqueeze(1))
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(y_b)
+
+        if scheduler is not None:
             scheduler.step()
 
         model.eval()
         preds, targets = [], []
         with torch.no_grad():
             for batch in val_loader:
-                out = model(batch["data"].to(device, non_blocking=True))
+                x_b = batch["data"].to(device, non_blocking=True)
+                mask_b = batch.get("mask", None)
+                if mask_b is not None:
+                    mask_b = mask_b.to(device, non_blocking=True)
+                len_b = batch.get("len_feat", None)
+                if len_b is not None:
+                    len_b = len_b.to(device, non_blocking=True)
+
+                out = model(x_b, mask=mask_b, lengths=len_b) if mask_b is not None else model(x_b)
                 probs = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out.view(-1))
                 preds.extend(probs.cpu().numpy().flatten())
                 targets.extend(batch["label"].numpy().flatten())
 
-        val_auc = roc_auc_score(targets, preds) if len(np.unique(targets)) > 1 else 0.5
-        print(f"Epoch {epoch:03d}/{cfg['epochs']:03d} | Train Loss: {total_loss/len(tr_ds):.4f} | Val AUC: {val_auc:.4f}")
+        preds_arr = np.nan_to_num(np.array(preds), nan=0.5)
+        targets_arr = np.array(targets)
+
+        val_auc = roc_auc_score(targets_arr, preds_arr) if len(np.unique(targets_arr)) > 1 else 0.5
+        val_prc = average_precision_score(targets_arr, preds_arr) if len(np.unique(targets_arr)) > 1 else 0.0
+        val_mcc = matthews_corrcoef(targets_arr, (preds_arr >= 0.5).astype(int)) if len(np.unique(targets_arr)) > 1 else 0.0
+        print(f"Epoch {epoch:02d}/{total_epochs:02d} | Train Loss: {total_loss/len(tr_ds):.4f} | Val AUC: {val_auc:.4f} | Val PRC: {val_prc:.4f} | Val MCC: {val_mcc:.4f}")
 
         if val_auc > best_auc:
             best_auc = val_auc
             patience_cnt = 0
-            torch.save({"model_state_dict": model.state_dict(), "epoch": epoch, "val_auc": val_auc}, best_path)
+            torch.save(model.state_dict(), best_path)
         else:
             patience_cnt += 1
-            if cfg["early_stop"] and patience_cnt >= cfg["patience"]:
+            if args.config in ["A", "D"] and patience_cnt >= args.patience:
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    if not cfg["early_stop"]:
-        torch.save({"model_state_dict": model.state_dict(), "epoch": cfg["epochs"], "val_auc": val_auc}, best_path)
-
-    print(f"Checkpoint saved: {best_path} (Best Val AUC: {best_auc:.4f})")
+    print(f"[✓] Checkpoint salvato: {best_path} (Best Val AUC: {best_auc:.4f})")
 
 
 if __name__ == "__main__":

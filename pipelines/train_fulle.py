@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Subnetwork training pipeline for FullE (5 branches + 5 mergers).
-"""
-
 import argparse
 import math
 import os
+import gc
 import sys
 import numpy as np
+import pandas as pd
 from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
@@ -33,16 +31,7 @@ class BinaryFocalLoss(nn.Module):
         return (self.alpha * (1 - torch.exp(-bce)) ** self.gamma * bce).mean()
 
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
-
-
-def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, device, freeze_branches=False):
+def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, device, freeze_branches=False, is_variable_len=False):
     is_ce = (config_name in ["C", "D"])
     if freeze_branches and isinstance(model, FullEMerger):
         for b in model.branches:
@@ -51,7 +40,6 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
 
     criterion = BinaryFocalLoss() if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    total_steps = len(tr_loader) * cfg["epochs"]
 
     if cfg["opt"] == "adamw":
         wd = 0.05 if config_name == "D" else 1e-4
@@ -62,8 +50,6 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
 
     if cfg["sched"] == "cosine":
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5))))
-    elif cfg["sched"] == "warmup_cosine":
-        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
     elif cfg["sched"] == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     else:
@@ -77,25 +63,32 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
         for batch in tr_loader:
             x_b = batch["data"].to(device, non_blocking=True)
             y_b = batch["label"].to(device, non_blocking=True)
+            mask_b = batch["mask"].to(device, non_blocking=True) if ("mask" in batch and is_variable_len) else None
+            len_b = batch.get("len_feat", None)
+            if len_b is not None and is_variable_len:
+                len_b = len_b.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(x_b)
-            loss = criterion(out, y_b.view(-1).long() if is_ce else y_b.view(-1).float())
+            out = model(x_b, mask=mask_b, lengths=len_b) if mask_b is not None else model(x_b)
+            loss = criterion(out, y_b.long() if is_ce else y_b.float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if config_name == "D" else 1.0)
             optimizer.step()
-            if cfg["sched"] in ["aiayn", "warmup_cosine"]:
-                scheduler.step()
 
-        if cfg["sched"] not in ["aiayn", "warmup_cosine"]:
-            scheduler.step()
+        scheduler.step()
 
         model.eval()
         preds, targets = [], []
         with torch.no_grad():
             for batch in val_loader:
-                out = model(batch["data"].to(device, non_blocking=True))
-                probs = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out.view(-1))
+                x_b = batch["data"].to(device, non_blocking=True)
+                mask_b = batch["mask"].to(device, non_blocking=True) if ("mask" in batch and is_variable_len) else None
+                len_b = batch.get("len_feat", None)
+                if len_b is not None and is_variable_len:
+                    len_b = len_b.to(device, non_blocking=True)
+
+                out = model(x_b, mask=mask_b, lengths=len_b) if mask_b is not None else model(x_b)
+                probs = F.softmax(out, dim=1)[:, 1] if is_ce else torch.sigmoid(out)
                 preds.extend(probs.cpu().numpy().flatten())
                 targets.extend(batch["label"].numpy().flatten())
 
@@ -114,11 +107,16 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FullE Subnetwork Training Pipeline")
+    parser = argparse.ArgumentParser(description="FullE 10-Subnetwork Training Pipeline")
+    parser.add_argument("--epochs", type=int, default=None, help="Override default epochs")
     parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
-    parser.add_argument("--task", type=str, default="viral", choices=["viral", "ecoli", "enhancer", "anellovirus"])
-    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"), help="Path to dataset folder (default: './datasets' or value of DATA_DIR environment variable)")
+    parser.add_argument("--task", type=str, default="viral")
+    parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"))
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--input_rep", type=str, default="onehot", choices=["onehot", "physhelical"])
+    parser.add_argument("--period_T", type=float, default=None)
+    parser.add_argument("--use_length_feature", action="store_true")
     parser.add_argument("--seed", type=int, default=2020)
     args = parser.parse_args()
 
@@ -132,53 +130,71 @@ def main():
         "D": {"epochs": 20, "early_stop": True, "patience": 8, "loss": "ce", "opt": "adamw", "sched": "warmup_cosine", "drop": 0.5, "out": 2},
     }
     cfg = config_map[args.config]
+    if args.epochs is not None:
+        cfg["epochs"] = args.epochs
+
+    is_variable_len = (args.task.lower() == "basith" or args.use_length_feature)
+    in_channels = 4 if args.input_rep == "physhelical" else 5
+    batch_size = args.batch_size if args.batch_size is not None else (16 if is_variable_len else 128)
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
-    print(f"[i] FullE Train | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | Length: {seq_len} bp | Train: {len(train_df)} | Val: {len(val_df)}")
+    print(f"[i] FullE Train | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | "
+          f"Length: {seq_len} bp | Rep: {args.input_rep} ({in_channels} ch) | BS: {batch_size} | Masked Pooling: {is_variable_len}")
 
-    tr_ds = SequenceClassificationDataset(train_df["sequence"].tolist(), train_df["label"].tolist(), "fulle", seq_len, args.config, is_train=True)
-    val_ds = SequenceClassificationDataset(val_df["sequence"].tolist(), val_df["label"].tolist(), "fulle", seq_len, args.config, is_train=False)
+    tr_ds = SequenceClassificationDataset(
+        train_df["sequence"].tolist(), train_df["label"].tolist(), "fulle", seq_len, args.config,
+        is_train=True, task=args.task, input_rep=args.input_rep, period_T=args.period_T
+    )
+    val_ds = SequenceClassificationDataset(
+        val_df["sequence"].tolist(), val_df["label"].tolist(), "fulle", seq_len, args.config,
+        is_train=False, task=args.task, input_rep=args.input_rep, period_T=args.period_T
+    )
 
-    tr_loader = DataLoader(tr_ds, batch_size=256, shuffle=True, num_workers=4, pin_memory=torch.cuda.is_available())
-    val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=4, pin_memory=torch.cuda.is_available())
+    tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
 
     branches = {
-        "freq": FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "freq_paper": FullEBranch(in_channels=5, out_channels=1000, kernel_size=8, pool_type="avg", dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "pat": FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="max", dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "pat_paper": FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="max", dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "lp": FullEBranch(in_channels=5, out_channels=1200, kernel_size=11, pool_type="lp", dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
+        "freq": FullEBranch(in_channels=in_channels, out_channels=1000, kernel_size=8, pool_type="avg", dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "freq_paper": FullEBranch(in_channels=in_channels, out_channels=1000, kernel_size=8, pool_type="avg", dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "pat": FullEBranch(in_channels=in_channels, out_channels=1200, kernel_size=11, pool_type="max", dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "pat_paper": FullEBranch(in_channels=in_channels, out_channels=1200, kernel_size=11, pool_type="max", dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "lp": FullEBranch(in_channels=in_channels, out_channels=1200, kernel_size=11, pool_type="lp", dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
     }
 
     print("\n--- Step 1/2: Training 5 Base Branches ---")
     for name, b in branches.items():
-        b, score = train_single_subnetwork(b, tr_loader, val_loader, cfg, args.config, device)
+        gc.collect()
+        torch.cuda.empty_cache()
+        b, score = train_single_subnetwork(b, tr_loader, val_loader, cfg, args.config, device, is_variable_len=is_variable_len)
         print(f" -> Branch '{name}' Best Val AUC: {score:.4f}")
 
     mergers = {
-        "merger_fpl": FullEMerger([branches["freq"], branches["pat"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "merger_fl": FullEMerger([branches["freq"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "merger_pl": FullEMerger([branches["pat"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "merger_vm": FullEMerger([branches["freq"], branches["pat"]], dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
-        "merger_vm_paper": FullEMerger([branches["freq_paper"], branches["pat_paper"]], dropout=cfg["drop"], num_classes=cfg["out"]).to(device),
+        "merger_fpl": FullEMerger([branches["freq"], branches["pat"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "merger_fl": FullEMerger([branches["freq"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "merger_pl": FullEMerger([branches["pat"], branches["lp"]], dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "merger_vm": FullEMerger([branches["freq"], branches["pat"]], dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
+        "merger_vm_paper": FullEMerger([branches["freq_paper"], branches["pat_paper"]], dropout=cfg["drop"], num_classes=cfg["out"], use_length_feature=is_variable_len).to(device),
     }
 
     print("\n--- Step 2/2: Training 5 Multi-Branch Mergers ---")
     for name, m in mergers.items():
-        m, score = train_single_subnetwork(m, tr_loader, val_loader, cfg, args.config, device, freeze_branches=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+        m, score = train_single_subnetwork(m, tr_loader, val_loader, cfg, args.config, device, freeze_branches=True, is_variable_len=is_variable_len)
         print(f" -> Merger '{name}' Best Val AUC: {score:.4f}")
 
     ensemble = FullE10Ensemble(branches, mergers, num_classes=cfg["out"]).to(device).eval()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.checkpoint_dir, f"best_fulle_{args.task}_{args.config}.pt")
+    rep_suffix = f"_{args.input_rep}" if args.input_rep != "onehot" else ""
+    ckpt_path = os.path.join(args.checkpoint_dir, f"best_fulle_{args.task}_{args.config}{rep_suffix}.pt")
     save_dict = {
         "model_state_dict": ensemble.state_dict(),
         "branches": {k: v.state_dict() for k, v in branches.items()},
         "mergers": {k: v.state_dict() for k, v in mergers.items()}
     }
     torch.save(save_dict, ckpt_path)
-    print(f"\nCheckpoint saved: {ckpt_path}")
+    print(f"\n[✓] Checkpoint Ensemble (10 reti) salvato: {ckpt_path}")
 
 
 if __name__ == "__main__":

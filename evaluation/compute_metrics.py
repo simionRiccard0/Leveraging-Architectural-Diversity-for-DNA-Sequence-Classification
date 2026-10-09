@@ -24,7 +24,6 @@ from sklearn.metrics import (
     f1_score
 )
 
-# Suppress division by zero warnings on edge-case thresholding
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -52,7 +51,6 @@ LABEL_CACHE = {}
 
 
 def resolve_data_root(custom_dir: str = None) -> str:
-    """Detects a valid dataset directory using CLI arguments, ENV variables, or relative paths."""
     candidates = [
         custom_dir,
         os.environ.get("DATA_DIR"),
@@ -71,29 +69,24 @@ def sigmoid(z: np.ndarray) -> np.ndarray:
 
 
 def find_dataset_file(test_set_name: str, data_root: str) -> str:
-    """Locate test set CSV files using structured lookup and recursive fallback."""
     direct_candidates = [
-        # E. coli
         os.path.join(data_root, "ecoli", "test_ecoli.csv"),
         os.path.join(data_root, "ecoli", "ecoli_independent_test_NT.csv"),
         os.path.join(data_root, "ecoli", "ecoli_test_NT.csv"),
         os.path.join(data_root, "ecoli_independent_test_NT.csv"),
         os.path.join(data_root, "ecoli_test_NT.csv"),
 
-        # Enhancer
         os.path.join(data_root, "enhancer", "test_enhancer.csv"),
         os.path.join(data_root, "enhancer", "bert_enhancer_ind_test_set.csv"),
         os.path.join(data_root, "enhancer", "bert_enhancer_test.csv"),
         os.path.join(data_root, "bert_enhancer_ind_test_set.csv"),
         os.path.join(data_root, "bert_enhancer_test.csv"),
 
-        # Anellovirus
         os.path.join(data_root, "anellovirus", "test_anellovirus.csv"),
         os.path.join(data_root, "unseen_anell", "test_data_anell_300_binary.csv"),
         os.path.join(data_root, "anellovirus", "test_data_anell_300_binary.csv"),
         os.path.join(data_root, "test_data_anell_300_binary.csv"),
 
-        # Viral VM
         os.path.join(data_root, "fullset_test.csv"),
         os.path.join(data_root, "VM", "fullset_test.csv"),
         os.path.join(data_root, "viral", "test_VM.csv"),
@@ -118,7 +111,6 @@ def find_dataset_file(test_set_name: str, data_root: str) -> str:
             if os.path.exists(c):
                 return c
 
-    # Noise pattern matching (DS-SIM benchmarks)
     m = re.match(r"test_sim_noise_(\d+)_seed_(\d+)_fullset_test", test_set_name)
     if m:
         noise_lvl, seed = m.groups()
@@ -132,7 +124,6 @@ def find_dataset_file(test_set_name: str, data_root: str) -> str:
             if os.path.exists(np_path):
                 return np_path
 
-    # Recursive glob fallback
     target_clean = test_set_name.replace("test_", "")
     matches = glob.glob(f"{data_root}/**/{test_set_name}.csv", recursive=True)
     if matches:
@@ -145,7 +136,6 @@ def find_dataset_file(test_set_name: str, data_root: str) -> str:
 
 
 def load_ground_truth(test_set_name: str, data_root: str) -> np.ndarray:
-    """Loads ground-truth binary labels (0/1) preserving sample indices."""
     if test_set_name in LABEL_CACHE:
         return LABEL_CACHE[test_set_name]
 
@@ -169,7 +159,6 @@ def load_ground_truth(test_set_name: str, data_root: str) -> np.ndarray:
 
 
 def safe_mcc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Computes Matthews Correlation Coefficient with zero-division safety."""
     if len(np.unique(y_pred)) < 2 or len(np.unique(y_true)) < 2:
         return 0.0
     try:
@@ -181,7 +170,6 @@ def safe_mcc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def compute_all_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
-    """Computes classification metrics using standard (0.5) and Youden's J optimal threshold."""
     if len(np.unique(y_true)) < 2:
         return {
             "AUROC": np.nan, "AUPRC": np.nan, "MCC": np.nan, "MCC_05": np.nan,
@@ -199,7 +187,6 @@ def compute_all_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
     except Exception:
         auprc = np.nan
 
-    # Youden's J threshold optimization (J = Sensitivity + Specificity - 1)
     try:
         fpr, tpr, thresholds = roc_curve(y_true, y_score)
         j_scores = tpr - fpr
@@ -315,7 +302,6 @@ def analyze_directory(logits_dir: str, data_root: str, output_suffix: str = ""):
 
     df_models = pd.DataFrame(records)
 
-    # Inter-Architectural Soft Voting Ensemble
     ens_records = []
     for (train_task, cfg, test_set), payload in ensemble_data.items():
         labels = payload["labels"]
@@ -373,9 +359,6 @@ def main():
     data_root = resolve_data_root(args.data_folder)
     print(f"[*] Identified Dataset Root: {data_root}")
 
-    # =========================================================================
-    # SECTION 1: MODULAR LOGITS EVALUATION
-    # =========================================================================
     print("\n" + "=" * 115)
     print(f"{'1. MODULAR BENCHMARK EVALUATION (' + args.dir_mod + ')':^115}")
     print("=" * 115)
@@ -387,9 +370,6 @@ def main():
             p_disp[col] = p_disp[col].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else "N/A")
         print(p_disp[["TrainTask", "TestSet", "Config", "Architecture", "AUROC", "AUPRC", "MCC", "BACC", "F1"]].to_string(index=False))
 
-    # =========================================================================
-    # SECTION 2: MONOLITHIC LOGITS EVALUATION
-    # =========================================================================
     print("\n" + "=" * 115)
     print(f"{'2. MONOLITHIC BENCHMARK EVALUATION (' + args.dir_mono + ')':^115}")
     print("=" * 115)
@@ -401,9 +381,6 @@ def main():
             p_disp_mono[col] = p_disp_mono[col].apply(lambda x: f"{x:.4f}" if pd.notnull(x) else "N/A")
         print(p_disp_mono[["TrainTask", "TestSet", "Config", "Architecture", "AUROC", "AUPRC", "MCC", "BACC", "F1"]].to_string(index=False))
 
-    # =========================================================================
-    # SECTION 3: MODULAR VS MONOLITHIC COMPARISON (DELTA ANALYSIS)
-    # =========================================================================
     if primary_mod is not None and primary_mono is not None and not primary_mod.empty and not primary_mono.empty:
         print("\n" + "=" * 115)
         print(f"{'3. MODULAR VS MONOLITHIC COMPARISON (AUROC DELTA = MODULAR - MONOLITHIC)':^115}")
@@ -422,9 +399,6 @@ def main():
             comp_disp[col] = comp_disp[col].apply(lambda x: f"{x:+.4f}" if pd.notnull(x) else "N/A")
         print(comp_disp[["TrainTask", "TestSet", "Config", "Architecture", "AUROC_Modular", "AUROC_Monolithic", "Delta_AUROC"]].to_string(index=False))
 
-    # =========================================================================
-    # SECTION 4: SEQUENCING NOISE ROBUSTNESS
-    # =========================================================================
     if combined_mod is not None and not combined_mod.empty:
         noise_df = combined_mod[combined_mod["TestSet"].str.contains("noise", case=False)].copy()
         if not noise_df.empty:
@@ -448,10 +422,6 @@ def main():
             print(noise_summary[["Noise_Level", "Config", "Architecture", "AUROC", "AUPRC", "MCC", "BACC", "F1"]].sort_values(by=["Noise_Level", "Config", "Architecture"]).to_string(index=False))
 
     print("\n[+] Metric extraction completed successfully.")
-    print("    - paper_metrics_all_modular.csv / paper_metrics_all_monolithic.csv")
-    print("    - paper_metrics_primary_modular.csv / paper_metrics_primary_monolithic.csv")
-    print("    - paper_metrics_comparison_delta.csv")
-    print("    - paper_metrics_noise_summary.csv")
 
 
 if __name__ == "__main__":
