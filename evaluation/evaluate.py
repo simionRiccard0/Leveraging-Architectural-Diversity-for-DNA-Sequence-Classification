@@ -18,6 +18,40 @@ from models.fulle import build_fulle_10ensemble
 from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset, load_seq_label_dataframe
 
 
+def load_fulle_weights(model, ckpt):
+    """Carica i pesi di FullE gestendo sia formati flat (branch_*/merger_*) sia model_state_dict."""
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
+        return
+
+    if isinstance(ckpt, dict) and "branches" in ckpt and isinstance(ckpt["branches"], dict):
+        flat = {}
+        for b_name, s_dict in ckpt["branches"].items():
+            for p_name, p_val in s_dict.items():
+                flat[f"branches.{b_name}.{p_name}"] = p_val
+        for m_name, s_dict in ckpt["mergers"].items():
+            for p_name, p_val in s_dict.items():
+                flat[f"mergers.{m_name}.{p_name}"] = p_val
+        model.load_state_dict(flat)
+        return
+
+    if isinstance(ckpt, dict) and any(k.startswith("branch_") for k in ckpt.keys()):
+        flat = {}
+        for top_k, s_dict in ckpt.items():
+            if top_k.startswith("branch_"):
+                b_name = top_k[len("branch_"):]
+                for p_name, p_val in s_dict.items():
+                    flat[f"branches.{b_name}.{p_name}"] = p_val
+            elif top_k.startswith("merger_"):
+                m_name = top_k[len("merger_"):]
+                for p_name, p_val in s_dict.items():
+                    flat[f"mergers.{m_name}.{p_name}"] = p_val
+        model.load_state_dict(flat)
+        return
+
+    model.load_state_dict(ckpt)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Universal Model Evaluation Script")
     parser.add_argument("--arch", type=str, required=True, choices=["sequencecnn", "genexplorer", "nucleictransformer", "dnabert2camp", "fulle"])
@@ -60,22 +94,29 @@ def main():
     safe_max_len = max(2048, seq_len + 64)
     is_variable_len = (args.task.lower() == "basith" or args.use_length_feature)
 
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    raw_state = ckpt["model_state_dict"] if (isinstance(ckpt, dict) and "model_state_dict" in ckpt) else ckpt
+
     if args.arch == "sequencecnn":
         model = SequenceCNN(in_channels=4, out_channels=num_classes, use_length_feature=is_variable_len)
+        model.load_state_dict(raw_state)
     elif args.arch == "genexplorer":
-        model = GenExplorer(in_channels=4, out_features=num_classes, max_len=safe_max_len, use_length_feature=is_variable_len)
+        if isinstance(raw_state, dict) and "transformer.pos_enc.weight" in raw_state:
+            ge_max_len = raw_state["transformer.pos_enc.weight"].shape[0] - 1
+        else:
+            ge_max_len = 512
+        model = GenExplorer(in_channels=4, out_features=num_classes, max_len=ge_max_len, use_length_feature=is_variable_len)
+        model.load_state_dict(raw_state)
     elif args.arch == "nucleictransformer":
         model = NucleicTransformer(ntoken=4, nclass=num_classes, ninp=512, kmers=args.kmers, max_len=max(2000, seq_len * 6))
+        model.load_state_dict(raw_state)
     elif args.arch == "dnabert2camp":
         model = DNABERT2CAMP(model_name_or_path=args.model_name_or_path, num_classes=num_classes)
+        model.load_state_dict(raw_state)
     elif args.arch == "fulle":
         model = build_fulle_10ensemble(in_channels=in_ch, num_classes=num_classes, use_length_feature=is_variable_len)
+        load_fulle_weights(model, ckpt)
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-    else:
-        model.load_state_dict(ckpt)
     model.to(device).eval()
 
     for test_tag, test_path in eval_dict.items():
@@ -107,7 +148,8 @@ def main():
                     else:
                         out = model(xb)
 
-                if is_ce:
+                # Fix dimensionalità: usa softmax solo se out ha effettivamente 2 o più colonne
+                if is_ce and (out.ndim > 1 and out.shape[-1] > 1):
                     probs = F.softmax(out, dim=1)[:, 1].cpu().numpy()
                     raw_logits = (out[:, 1] - out[:, 0]).cpu().numpy()
                 else:
