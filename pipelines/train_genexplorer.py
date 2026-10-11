@@ -91,6 +91,7 @@ def main():
             {"params": other_p, "lr": 1e-4},
             {"params": trans_p, "lr": 5e-5}
         ], weight_decay=1e-4)
+        # Cosine annealing preceduto da 5 epoche di linear warmup
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
             lambda ep: (ep + 1) / 5.0 if ep < 5 else 0.5 * (1.0 + math.cos(math.pi * (ep - 5) / max(1, total_epochs - 5)))

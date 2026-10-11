@@ -120,17 +120,16 @@ class WarmupThenPlateau:
 # -----------------------------------------------------------------------------
 
 def mutate_dna_sequence(sequences: torch.Tensor, nmute: int) -> torch.Tensor:
-    """Stochastic nucleotide mutation applied only in Config C."""
     if nmute <= 0:
         return sequences
     mutated = sequences.clone()
     B, L = mutated.shape
     nmute = min(nmute, L - 1)
-
     for i in range(B):
         mute_indices = torch.randperm(L, device=sequences.device)[:nmute]
-        random_tokens = torch.randint(0, 4, (nmute,), dtype=mutated.dtype, device=sequences.device)
-        mutated[i, mute_indices] = random_tokens
+        orig = mutated[i, mute_indices]
+        shifts = torch.randint(1, 4, (nmute,), dtype=mutated.dtype, device=sequences.device)
+        mutated[i, mute_indices] = (orig + shifts) % 4
     return mutated
 
 
@@ -194,7 +193,7 @@ def main():
                         help="Kernel size(s) for k-mer aggregation (e.g., --kmers 13)")
     parser.add_argument("--suffix", type=str, default="",
                         help="Checkpoint filename suffix (e.g., _k13_nmute40)")
-    parser.add_argument("--top_k_swa", type=int, default=1)
+    parser.add_argument("--top_k_swa", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2020)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"],
                         help="AMP precision format")
@@ -212,10 +211,10 @@ def main():
     dropout_map = {"A": 0.25, "B": 0.2, "C": 0.1, "D": 0.5}
     drop = dropout_map[args.config]
 
-    is_ce = (args.config == "C")
+    is_ce = (args.config in ["C", "D"])
     nclass = 2 if is_ce else 1
 
-    actual_nmute = min(args.nmute, max(1, math.floor(0.13 * seq_len))) if (is_ce and args.nmute > 0) else 0
+    actual_nmute = min(args.nmute, max(1, math.floor(0.13 * seq_len))) if (args.config == "C" and args.nmute > 0) else 0
 
     train_ds = SequenceClassificationDataset(
         train_df["sequence"].tolist(), train_df["label"].tolist(),
@@ -230,7 +229,7 @@ def main():
     num_pos = float(train_df["label"].sum())
     num_neg = float(len(train_df) - num_pos)
     imbalance_ratio = num_neg / max(1.0, num_pos)
-    use_weighted_sampler = is_ce and imbalance_ratio > 5.0
+    use_weighted_sampler = (args.config == "C") and (imbalance_ratio > 5.0)
 
     if use_weighted_sampler:
         labels_arr = train_df["label"].to_numpy()
@@ -286,9 +285,9 @@ def main():
         aiayn_sched = lr_AIAYN(optimizer, d_model=512, warmup_steps=3200, factor=0.1)
         criterion = nn.CrossEntropyLoss()
     elif args.config == "D":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
-        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.05), num_training_steps=total_steps)
-        criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.05)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.10), num_training_steps=total_steps)
+        criterion = nn.CrossEntropyLoss()
 
     scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16))
 

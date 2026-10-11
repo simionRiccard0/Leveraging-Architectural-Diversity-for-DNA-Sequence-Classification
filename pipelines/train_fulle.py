@@ -26,40 +26,70 @@ class BinaryFocalLoss(nn.Module):
         self.alpha, self.gamma, self.smoothing = alpha, gamma, smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        targets_smooth = targets.unsqueeze(1) * (1 - self.smoothing) + 0.5 * self.smoothing
-        bce = F.binary_cross_entropy_with_logits(logits.unsqueeze(1), targets_smooth, reduction="none")
-        return (self.alpha * (1 - torch.exp(-bce)) ** self.gamma * bce).mean()
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+        targets_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
+        bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction="none")
+        probs = torch.sigmoid(logits)
+        p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
+        alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+        return (alpha_t * ((1.0 - p_t) ** self.gamma) * bce).mean()
 
 
 def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, device, freeze_branches=False, is_variable_len=False):
     is_ce = (config_name in ["C", "D"])
     if freeze_branches and isinstance(model, FullEMerger):
         for b in model.branches:
+            b.eval()  # Disattiva BatchNorm updates e Dropout durante feature extraction
             for p in b.parameters():
                 p.requires_grad = False
 
     criterion = BinaryFocalLoss() if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
+    total_steps = len(tr_loader) * cfg["epochs"]
+
     if cfg["opt"] == "adamw":
         wd = 0.05 if config_name == "D" else 1e-4
         optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=wd)
     else:
-        lr_base = 0.001 if config_name == "B" else 1.0
+        # Config B usa lr fisso 0.001; Config C usa Noam schedule che richiede base_lr=1.0
+        lr_base = 0.001 if config_name == "B" else (1.0 if config_name == "C" else 1e-4)
         optimizer = torch.optim.Adam(trainable_params, lr=lr_base)
 
+    step_per_batch = False
     if cfg["sched"] == "cosine":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / (cfg["epochs"] - 5))))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (ep + 1) / 5 if ep < 5 else 0.5 * (1 + math.cos(math.pi * (ep - 5) / max(1, cfg["epochs"] - 5))))
     elif cfg["sched"] == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    elif cfg["sched"] == "warmup_cosine":
+        warmup_steps = int(total_steps * 0.10)
+        def lr_cos(step):
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            prog = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * prog)))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_cos)
+        step_per_batch = True
+    elif cfg["sched"] == "aiayn":
+        warmup_steps = 3200
+        def lr_noam(step):
+            step = max(1, step)
+            return (512 ** -0.5) * min(step ** -0.5, step * (warmup_steps ** -1.5)) * 0.1
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_noam)
+        step_per_batch = True
     else:
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: (512**-0.5) * min(max(1, s)**-0.5, max(1, s) * (4000**-1.5)))
+        scheduler = None
 
     best_auc, best_state = 0.0, None
     patience_cnt = 0
 
     for ep in range(1, cfg["epochs"] + 1):
         model.train()
+        if freeze_branches and isinstance(model, FullEMerger):
+            for b in model.branches:
+                b.eval()
+
         for batch in tr_loader:
             x_b = batch["data"].to(device, non_blocking=True)
             y_b = batch["label"].to(device, non_blocking=True)
@@ -75,7 +105,11 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.8 if config_name == "D" else 1.0)
             optimizer.step()
 
-        scheduler.step()
+            if step_per_batch and scheduler is not None:
+                scheduler.step()
+
+        if not step_per_batch and scheduler is not None:
+            scheduler.step()
 
         model.eval()
         preds, targets = [], []
@@ -133,8 +167,11 @@ def main():
     if args.epochs is not None:
         cfg["epochs"] = args.epochs
 
+    # Attivazione rigorosa del masking e del length prior solo quando necessario
     is_variable_len = (args.task.lower() == "basith" or args.use_length_feature)
     in_channels = 4 if args.input_rep == "physhelical" else 5
+
+    # Batch size: se non specificato, 16 su Basith per prevenire OOM, 128 su sequenze brevi
     batch_size = args.batch_size if args.batch_size is not None else (16 if is_variable_len else 128)
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
