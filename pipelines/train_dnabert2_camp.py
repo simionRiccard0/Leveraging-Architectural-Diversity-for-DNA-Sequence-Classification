@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--head_lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=2020)
     parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--focal_alpha", type=float, default=0.75, help="Alpha parameter for Binary Focal Loss")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -88,7 +89,7 @@ def main():
     total_optimizer_steps = (len(tr_loader) // args.accum_steps) * total_epochs
 
     if args.config == "A":
-        criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
+        criterion = BinaryFocalLoss(alpha=args.focal_alpha, gamma=2.0)
         optimizer = torch.optim.AdamW(param_groups, eps=1e-8)
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_optimizer_steps * 0.10), num_training_steps=total_optimizer_steps)
     elif args.config == "B":
