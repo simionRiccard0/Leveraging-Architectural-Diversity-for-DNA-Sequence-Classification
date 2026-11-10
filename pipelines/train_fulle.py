@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.fulle import FullEBranch, FullEMerger, FullE10Ensemble
-from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset
+from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset, RC_CHOICES, parse_rc
 
 
 class BinaryFocalLoss(nn.Module):
@@ -40,11 +40,11 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
     is_ce = (config_name in ["C", "D"])
     if freeze_branches and isinstance(model, FullEMerger):
         for b in model.branches:
-            b.eval()  # Disattiva BatchNorm updates e Dropout durante feature extraction
+            b.eval()  # frozen branches: no BatchNorm updates and no dropout
             for p in b.parameters():
                 p.requires_grad = False
 
-    criterion = BinaryFocalLoss() if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
+    criterion = BinaryFocalLoss(alpha=cfg.get("focal_alpha", 0.75)) if cfg["loss"] == "focal" else (nn.BCEWithLogitsLoss() if cfg["loss"] == "bce" else nn.CrossEntropyLoss())
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     total_steps = len(tr_loader) * cfg["epochs"]
@@ -53,7 +53,7 @@ def train_single_subnetwork(model, tr_loader, val_loader, cfg, config_name, devi
         wd = 0.05 if config_name == "D" else 1e-4
         optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=wd)
     else:
-        # Config B usa lr fisso 0.001; Config C usa Noam schedule che richiede base_lr=1.0
+        # config B: fixed lr 1e-3; config C: Noam schedule, which needs base_lr=1.0
         lr_base = 0.001 if config_name == "B" else (1.0 if config_name == "C" else 1e-4)
         optimizer = torch.optim.Adam(trainable_params, lr=lr_base)
 
@@ -148,9 +148,9 @@ def main():
     parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"))
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
     parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--input_rep", type=str, default="onehot", choices=["onehot", "physhelical"])
-    parser.add_argument("--period_T", type=float, default=None)
-    parser.add_argument("--use_length_feature", action="store_true")
+    parser.add_argument("--use_length_feature", action="store_true", help="Masked pooling + length prior (variable-length inputs)")
+    parser.add_argument("--rc", choices=RC_CHOICES, default="auto", help="Reverse complement in config A (auto: off on ECO)")
+    parser.add_argument("--focal_alpha", type=float, default=0.75, help="Focal-loss alpha (config A)")
     parser.add_argument("--seed", type=int, default=2020)
     args = parser.parse_args()
 
@@ -166,25 +166,23 @@ def main():
     cfg = config_map[args.config]
     if args.epochs is not None:
         cfg["epochs"] = args.epochs
+    cfg["focal_alpha"] = args.focal_alpha
 
-    # Attivazione rigorosa del masking e del length prior solo quando necessario
-    is_variable_len = (args.task.lower() == "basith" or args.use_length_feature)
-    in_channels = 4 if args.input_rep == "physhelical" else 5
-
-    # Batch size: se non specificato, 16 su Basith per prevenire OOM, 128 su sequenze brevi
-    batch_size = args.batch_size if args.batch_size is not None else (16 if is_variable_len else 128)
+    is_variable_len = args.use_length_feature
+    in_channels = 5  # one-hot A/C/G/T + N channel
+    batch_size = args.batch_size if args.batch_size is not None else 128
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
     print(f"[i] FullE Train | Task: '{args.task}' | Config: '{args.config}' (Classes: {cfg['out']}) | "
-          f"Length: {seq_len} bp | Rep: {args.input_rep} ({in_channels} ch) | BS: {batch_size} | Masked Pooling: {is_variable_len}")
+          f"Length: {seq_len} bp | Rep: onehot ({in_channels} ch) | BS: {batch_size} | Masked Pooling: {is_variable_len}")
 
     tr_ds = SequenceClassificationDataset(
         train_df["sequence"].tolist(), train_df["label"].tolist(), "fulle", seq_len, args.config,
-        is_train=True, task=args.task, input_rep=args.input_rep, period_T=args.period_T
+        is_train=True, task=args.task, use_rc=parse_rc(args.rc)
     )
     val_ds = SequenceClassificationDataset(
         val_df["sequence"].tolist(), val_df["label"].tolist(), "fulle", seq_len, args.config,
-        is_train=False, task=args.task, input_rep=args.input_rep, period_T=args.period_T
+        is_train=False, task=args.task
     )
 
     tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
@@ -223,15 +221,14 @@ def main():
     ensemble = FullE10Ensemble(branches, mergers, num_classes=cfg["out"]).to(device).eval()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    rep_suffix = f"_{args.input_rep}" if args.input_rep != "onehot" else ""
-    ckpt_path = os.path.join(args.checkpoint_dir, f"best_fulle_{args.task}_{args.config}{rep_suffix}.pt")
+    ckpt_path = os.path.join(args.checkpoint_dir, f"best_fulle_{args.task}_{args.config}.pt")
     save_dict = {
         "model_state_dict": ensemble.state_dict(),
         "branches": {k: v.state_dict() for k, v in branches.items()},
         "mergers": {k: v.state_dict() for k, v in mergers.items()}
     }
     torch.save(save_dict, ckpt_path)
-    print(f"\n[✓] Checkpoint Ensemble (10 reti) salvato: {ckpt_path}")
+    print(f"\n[✓] FullE checkpoint (10 networks) saved: {ckpt_path}")
 
 
 if __name__ == "__main__":

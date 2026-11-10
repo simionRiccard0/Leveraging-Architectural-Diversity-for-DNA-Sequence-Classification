@@ -1,27 +1,33 @@
-datasets/
-*.sif
-*.pth
+# Extracted datasets (the archives in datasets/*.zip are tracked)
+datasets/*/
+*.csv
+*.tsv
+
+# Training and evaluation outputs
+checkpoints*/
+global_logits*/
+ablation_c1/
+ablation_get/
+logs/
+*.out
+*.err
+
+# Model weights and containers
 *.pt
-*.ptm
+*.pth
 *.ckpt
 *.bin
 *.onnx
-*.rar
-# # *.zip
-*.tar.gz
+*.h5
+*.hdf5
+*.sif
+*.done
+*.partial_*
+
+# Python / editors
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-
-# Ignora pesi HDF5 e cartelle dati pesanti
-*.hdf5
-*.h5
-virproject/ViraMiner/data/
-virproject/data_profs/
-virproject/ViraMiner/final_ViraMiner/
-
-# Escludi tutti i dataset CSV e file pesanti
-*.csv
-*.tsv
-virproject/ViraMiner/data/
-virproject/data_profs/
+.vscode/
+.idea/
+*.tar.gz

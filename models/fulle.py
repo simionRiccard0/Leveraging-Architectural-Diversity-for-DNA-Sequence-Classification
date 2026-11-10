@@ -1,5 +1,6 @@
 """
 FullE: 10-Subnetwork Convolutional Neural Network Ensemble with Parameterized Lp Pooling.
+Supports variable-length masking and length prior exclusively when active.
 """
 
 from typing import List, Dict, Optional
@@ -209,6 +210,7 @@ def build_fulle_10ensemble(
     dropout: float = 0.2,
     use_length_feature: bool = False
 ) -> FullE10Ensemble:
+    """Builds the 10-network FullE ensemble (5 branches + 5 mergers)."""
     branches = {
         "freq": FullEBranch(in_channels=in_channels, out_channels=1000, kernel_size=8, pool_type="avg", dropout=dropout, num_classes=num_classes, use_length_feature=use_length_feature),
         "freq_paper": FullEBranch(in_channels=in_channels, out_channels=1000, kernel_size=8, pool_type="avg", dropout=dropout, num_classes=num_classes, use_length_feature=use_length_feature),

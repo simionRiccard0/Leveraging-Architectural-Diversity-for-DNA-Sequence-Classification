@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+HelixPR (Shi et al.): helix-aware periodic representation + 4-layer 1D CNN.
+Used in the paper as a literature baseline, trained on our splits with config A
+(the only configuration evaluated for HelixPR); evaluate with
+`evaluation/evaluate.py --arch helixpr --config A`.
+"""
 
 import argparse
 import os
@@ -11,7 +17,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from models.sequencecnn import SequenceCNN
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from models.helixpr import HelixPR
 from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset
 
 
@@ -32,17 +41,17 @@ class BinaryFocalLoss(nn.Module):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SequenceCNN Training Pipeline")
+    parser = argparse.ArgumentParser(description="HelixPR Training Pipeline")
     parser.add_argument("--epochs", type=int, default=None, help="Override default epochs")
-    parser.add_argument("--config", type=str, required=True, choices=["A", "B", "C", "D"])
+    parser.add_argument("--config", type=str, default="A", choices=["A", "B", "C", "D"],
+                        help="A = protocol used in the paper for HelixPR (the only one evaluated)")
     parser.add_argument("--task", type=str, default="viral")
     parser.add_argument("--data_folder", default=os.environ.get("DATA_DIR", "./datasets"))
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=2020)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--input_rep", type=str, default="onehot", choices=["onehot", "physhelical"])
     parser.add_argument("--period_T", type=float, default=None)
     parser.add_argument("--use_length_feature", action="store_true")
     args = parser.parse_args()
@@ -56,32 +65,32 @@ def main():
     num_classes = 2 if is_ce else 1
 
     train_df, val_df, seq_len, _ = resolve_task_splits(args.task, args.data_folder, args.seed)
-    print(f"[i] Training SequenceCNN | Task: '{args.task}' | Config: '{args.config}' (Classes: {num_classes}) | "
-          f"Rep: {args.input_rep} | Length Feature: {args.use_length_feature} | Train: {len(train_df)} | Val: {len(val_df)}")
+    print(f"[i] Training HelixPR | Task: '{args.task}' | Config: '{args.config}' (Classes: {num_classes}) | "
+          f"Length Feature: {args.use_length_feature} | Train: {len(train_df)} | Val: {len(val_df)}")
 
     tr_ds = SequenceClassificationDataset(
         train_df["sequence"].tolist(), train_df["label"].tolist(),
-        arch="sequencecnn", target_len=seq_len, config=args.config, is_train=True,
-        task=args.task, input_rep=args.input_rep, period_T=args.period_T
+        arch="helixpr", target_len=seq_len, config=args.config, is_train=True,
+        task=args.task, input_rep="helixpr", period_T=args.period_T
     )
     val_ds = SequenceClassificationDataset(
         val_df["sequence"].tolist(), val_df["label"].tolist(),
-        arch="sequencecnn", target_len=seq_len, config=args.config, is_train=False,
-        task=args.task, input_rep=args.input_rep, period_T=args.period_T
+        arch="helixpr", target_len=seq_len, config=args.config, is_train=False,
+        task=args.task, input_rep="helixpr", period_T=args.period_T
     )
 
     tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
 
-    model = SequenceCNN(
+    model = HelixPR(
         in_channels=4,
-        out_channels=num_classes,
+        num_classes=num_classes,
         use_length_feature=args.use_length_feature
     ).to(device)
 
     if args.config == "A":
         criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
     elif args.config == "B":
         criterion = nn.BCEWithLogitsLoss()
@@ -98,8 +107,7 @@ def main():
 
     best_auc, patience_cnt = 0.0, 0
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    suffix = f"_{args.input_rep}" if args.input_rep != "onehot" else ""
-    best_path = os.path.join(args.checkpoint_dir, f"best_sequencecnn_{args.task}_{args.config}{suffix}.pt")
+    best_path = os.path.join(args.checkpoint_dir, f"best_helixpr_{args.task}_{args.config}.pt")
 
     for epoch in range(1, total_epochs + 1):
         model.train()
@@ -117,7 +125,7 @@ def main():
                 len_b = len_b.to(device, non_blocking=True)
 
             out = model(x_b, mask=mask_b, lengths=len_b) if mask_b is not None else model(x_b)
-            loss = criterion(out, y_b.long() if is_ce else y_b.float().unsqueeze(1))
+            loss = criterion(out, y_b.long() if is_ce else y_b.float())
 
             loss.backward()
             optimizer.step()
@@ -161,7 +169,7 @@ def main():
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    print(f"[✓] Checkpoint salvato: {best_path} (Best Val AUC: {best_auc:.4f})")
+    print(f"[✓] Checkpoint saved: {best_path} (Best Val AUC: {best_auc:.4f})")
 
 
 if __name__ == "__main__":

@@ -12,8 +12,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from models.dnabert2_camp import DNABERT2CAMP
-from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset
+from utils.data_utils import seed_everything, resolve_task_splits, SequenceClassificationDataset, RC_CHOICES, parse_rc
 
 
 class BinaryFocalLoss(nn.Module):
@@ -51,7 +54,8 @@ def main():
     parser.add_argument("--head_lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=2020)
     parser.add_argument("--patience", type=int, default=8)
-    parser.add_argument("--focal_alpha", type=float, default=0.75, help="Alpha parameter for Binary Focal Loss")
+    parser.add_argument("--focal_alpha", type=float, default=0.75, help="Focal-loss alpha (config A)")
+    parser.add_argument("--rc", choices=RC_CHOICES, default="auto", help="Reverse complement in config A (auto: off on ECO)")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -69,8 +73,8 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
-    tr_ds = SequenceClassificationDataset(train_df["sequence"].tolist(), train_df["label"].tolist(), "dnabert2camp", seq_len, args.config, is_train=True, tokenizer=tokenizer)
-    val_ds = SequenceClassificationDataset(val_df["sequence"].tolist(), val_df["label"].tolist(), "dnabert2camp", seq_len, args.config, is_train=False, tokenizer=tokenizer)
+    tr_ds = SequenceClassificationDataset(train_df["sequence"].tolist(), train_df["label"].tolist(), "dnabert2camp", seq_len, args.config, is_train=True, tokenizer=tokenizer, task=args.task, use_rc=parse_rc(args.rc))
+    val_ds = SequenceClassificationDataset(val_df["sequence"].tolist(), val_df["label"].tolist(), "dnabert2camp", seq_len, args.config, is_train=False, tokenizer=tokenizer, task=args.task)
 
     tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
@@ -162,7 +166,7 @@ def main():
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    print(f"[✓] Checkpoint salvato: {best_path} (Best Val AUC: {best_auc:.4f})")
+    print(f"[✓] Checkpoint saved: {best_path} (Best Val AUC: {best_auc:.4f})")
 
 
 if __name__ == "__main__":

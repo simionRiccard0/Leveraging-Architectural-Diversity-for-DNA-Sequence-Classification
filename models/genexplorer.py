@@ -1,6 +1,8 @@
 """
 GenExplorer: Hybrid Multi-Branch Neural Architecture for DNA Sequence Classification.
 Combines multi-scale convolutions (Pattern & Frequency) with a self-attention Transformer branch.
+Updated with Masked Pooling, Transformer Attention Padding Mask, and Length Prior.
+Supports 3-channel (Komlós-Hadamard), 4-channel (one-hot, HelixPR) and 5-channel inputs.
 """
 
 from typing import Optional
@@ -25,7 +27,7 @@ class PatternBranch(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if x.dim() == 3 and x.shape[-1] in (4, 5):
+        if x.dim() == 3 and x.shape[-1] in (3, 4, 5):
             x = x.permute(0, 2, 1)
 
         c = torch.cat([
@@ -66,7 +68,7 @@ class FrequencyBranch(nn.Module):
         mask: Optional[torch.Tensor] = None,
         lengths: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if x.dim() == 3 and x.shape[-1] in (4, 5):
+        if x.dim() == 3 and x.shape[-1] in (3, 4, 5):
             x = x.permute(0, 2, 1)
 
         c = torch.cat([
@@ -169,13 +171,13 @@ class GenExplorer(nn.Module):
         lengths: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if x.shape[-1] == 5:
-            x_4 = x[..., :4]
+            x_in = x[..., :4]
         else:
-            x_4 = x
+            x_in = x
 
-        h_pat = self.pattern(x_4, mask=mask)
-        h_freq = self.frequency(x_4, mask=mask, lengths=lengths)
-        h_trans = self.transformer(x_4, mask=mask)
+        h_pat = self.pattern(x_in, mask=mask)
+        h_freq = self.frequency(x_in, mask=mask, lengths=lengths)
+        h_trans = self.transformer(x_in, mask=mask)
 
         h_fused = torch.cat([h_pat, h_freq, h_trans], dim=1)
 

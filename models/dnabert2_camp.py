@@ -1,5 +1,5 @@
 """
-DNABERT2-CAMP: Pre-trained Genomic Foundation Model integrated with a CAMP Motif Refinement Module.
+DNABERT2-CAMP: Pre-trained Genomic Foundation Model integrated with a CAMP Motif Refinement Module[cite: 1, 2].
 """
 
 import torch
@@ -38,15 +38,15 @@ class DNABERT2CAMP(nn.Module):
     def __init__(self, model_name_or_path: str = "zhihan1996/DNABERT-2-117M", num_classes: int = 1, dropout: float = 0.5):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
-        hidden_dim = self.bert.config.hidden_size
+        hidden_dim = self.bert.config.hidden_size  # 768
         self.num_classes = num_classes
-
+        
         self.pooler = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh()
         )
         self.camp = CAMPModule(in_dim=hidden_dim)
-
+        
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim + 128, 128),
             nn.LayerNorm(128),
@@ -57,10 +57,10 @@ class DNABERT2CAMP(nn.Module):
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         seq_output = outputs[0]
-
+        
         trans_pooled = self.pooler(seq_output[:, 0, :])
         camp_pooled = self.camp(seq_output)
-
+        
         fused = torch.cat([trans_pooled, camp_pooled], dim=1)
         out = self.classifier(fused)
         return out.squeeze(-1) if self.num_classes == 1 else out

@@ -1,34 +1,24 @@
-"""
-Architectural definitions for raw DNA sequence classification models.
-"""
-
 from .genexplorer import GenExplorer
+from .genexplorer_ablation import GenExplorerAblation
 from .fulle import FullE10Ensemble, FullEBranch, FullEMerger
 from .nucleic_transformer import NucleicTransformer
-from .sequencecnn import SequenceCNN
-
+from .helixpr import HelixPR
 
 FullEEnsemble = FullE10Ensemble
 
-try:
+__all__ = [
+    "GenExplorer",
+    "GenExplorerAblation",
+    "FullE10Ensemble",
+    "FullEEnsemble",
+    "FullEBranch",
+    "FullEMerger",
+    "NucleicTransformer",
+    "HelixPR",
+]
+
+try:  # DNABERT2-CAMP requires `transformers` (and optionally triton)
     from .dnabert2_camp import DNABERT2CAMP
-    __all__ = [
-        "GenExplorer",
-        "FullE10Ensemble",
-        "FullEEnsemble",
-        "FullEBranch",
-        "FullEMerger",
-        "NucleicTransformer",
-        "DNABERT2CAMP",
-        "SequenceCNN",
-    ]
+    __all__.append("DNABERT2CAMP")
 except ImportError:
-    __all__ = [
-        "GenExplorer",
-        "FullE10Ensemble",
-        "FullEEnsemble",
-        "FullEBranch",
-        "FullEMerger",
-        "NucleicTransformer",
-        "SequenceCNN",
-    ]
+    pass

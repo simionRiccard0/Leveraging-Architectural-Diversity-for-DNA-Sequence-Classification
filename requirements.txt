@@ -1,10 +1,8 @@
 torch>=2.0.0
-torchvision
 numpy>=1.22.0
 pandas>=1.5.0
 scikit-learn>=1.2.0
-scipy>=1.10.0
+# DNABERT2-CAMP only
 transformers>=4.30.0
 einops
-triton
-tqdm
+triton  # optional: flash-attention kernels of DNABERT-2 (GPU)

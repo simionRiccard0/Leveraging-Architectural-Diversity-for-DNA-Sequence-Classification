@@ -1,295 +1,173 @@
 # Leveraging Architectural Diversity for DNA Sequence Classification
 
+Code for the benchmark of four deep learning paradigms for DNA sequence classification from raw nucleotides:
 
-This repository implements a multi-domain benchmark to evaluate how diverse deep learning paradigms generalize across heterogeneous genomic sequence classification tasks directly from raw nucleotide sequences without manual feature extraction.
-The repository provides a dual execution framework: a decoupled workflow (strictly separating training/checkpointing from standalone inference) alongside end-to-end pipelines, ensuring complete experimental flexibility and post-hoc logit analysis across biological benchmarks.
-
----
-## Research Objective
-
-While domain-specific models demonstrate strong performance in specialized genomic tasks, there remains a critical need for a systematic comparative analysis evaluating the trade-offs between **convolutional local motif extraction** and **attention-based global contextual modeling**.
-
-The primary objective of this project is to benchmark pure CNNs, multi-branch hybrid architectures, and Transformer models across:
-
-* **Diverse Sequence Lengths & Biological Contexts**: Ranging from short 81 bp regulatory elements to 300 bp metagenomic fragments.
-* **Out-of-Distribution (OOD) Generalization**: Assessing model performance when encountering completely unseen viral taxonomic families.
-* **Sequencing Error Robustness**: Measuring accuracy degradation under synthetic mutation/corruption noise levels (1%, 5%, 10%).
-
----
-
-## Evaluated Neural Architectures
-
-We benchmark four distinct architectural paradigms, exploring the trade-offs between local motif discovery, nucleotide frequency modeling, and attention mechanisms:
-
-| Paradigm | Architecture | Core Structural Philosophy |
+| Paradigm | Architecture | Key components |
 | :--- | :--- | :--- |
-| **Hybrid Multi-Branch** | **GenExplorer** | Combines multi-scale 1D convolutions (`PatternBranch` with max pooling and `FrequencyBranch` with average pooling) with a parallel 4-layer `TransformerBranch` to simultaneously capture local motifs, base frequencies, and global positional context via late MLP fusion. |
-| **Multi-Branch CNN Ensemble** | **FullE** | An ensemble of 1D CNN subnetworks featuring multi-scale convolutions and parameterized $L_p$ power-average pooling—which dynamically interpolates between mean pooling ($p=1$) and max pooling ($p \to \infty$). Submodels and merger networks are combined via a 10-model Sum-Rule decision fusion. |
-| **Convolutional Transformer** | **Nucleic Transformer** | Formulates sequence classification using 1D convolutional $k$-mer tokenization (kernels $k \in \{2..6\}$) to generate learnable $k$-mer tokens, followed by a 6-layer Transformer Encoder stack with Generalized Mean (GeM) Pooling with learnable power parameter $p$. |
-|**Genomic Foundation Model** | **DNABERT2-CAMP** | Leverages the pre-trained DNABERT-2 (117M) transformer backbone fine-tuned alongside a CAMP (Convolutional Attention Motif Profiler) module—a 4-layer 1D CNN cascade coupled with Multi-Head Self-Attention for localized motif refinement. |
----
+| Hybrid CNN–Transformer | **GenExplorer** (proposed) | Multi-scale convolutional `PatternBranch` (max pooling) and `FrequencyBranch` (average pooling), a parallel 4-layer `TransformerBranch`, late MLP fusion |
+| Multi-branch CNN ensemble | **FullE** | Five convolutional branches (average, max and $L_p$ power-average pooling) and five merger networks, combined by sum rule (10 networks) |
+| Convolutional Transformer | **Nucleic Transformer** | Convolutional $k$-mer aggregation ($k=2..6$), 6-layer Transformer encoder, GeM pooling |
+| Genomic foundation model | **DNABERT2-CAMP** | Pre-trained DNABERT-2 (117M) fine-tuned with a CAMP module (4-layer CNN cascade + multi-head attention) |
 
-## Experimental Strategy: $4 \times 4$ Symmetrical Cross-Benchmarking
-
-To evaluate both **native optimization** and **cross-paradigm adaptability**, each architecture is systematically trained and evaluated across **four distinct configuration strategies ($C_1, C_2, C_3, C_4$)**, forming a complete $4 \times 4$ evaluation matrix.
-
-```text
-                 ┌──────────────────────────────────────────────────────────┐
-                 │                 Evaluation Architectures                 │
-                 │ [ GenExplorer | FullE | Nucleic-Trans. | DNABERT2-CAMP ] │
-                 └────────────────────────────┬─────────────────────────────┘
-                                              │
-        ┌─────────────────────┬───────────────┴───────────────┬─────────────────────┐
-        ▼                     ▼                               ▼                     ▼
-┌──────────────┐      ┌──────────────┐                ┌──────────────┐      ┌──────────────┐
-│ Config A (C1)│      │ Config B (C2)│                │ Config C (C3)│      │ Config D (C4)│
-│ GenExplorer  │      │    FullE     │                │ Nucleic-Tr.  │      │  DNABERT-2   │
-│    Native    │      │    Native    │                │    Native    │      │    Native    │
-└──────────────┘      └──────────────┘                └──────────────┘      └──────────────┘
-````
-
-### Configuration Specifications
-
-### 1. Configuration A ($C_1$ – GenExplorer Strategy)
-
-* **Optimization Goal**: Maximizes class-imbalance resilience and multi-branch feature learning.
-* **Loss Function**: Focal Loss ($\alpha = 0.75, \gamma = 2.0$) with Label Smoothing ($\epsilon = 0.05$).
-* **Optimizer & Schedule**: AdamW ($lr_{\text{backbone}} = 1\times 10^{-4}$, $lr_{\text{transformer}} = 5\times 10^{-5}$, weight decay $= 1\times 10^{-4}$) with a 5-epoch linear warmup followed by Cosine Annealing.
-* **Data Augmentation**: Stochastic Reverse Complement ($p=0.5$) and random positional sequence shifts within $\pm 5\text{ bp}$.
-* **Training Protocol**: 120 epochs maximum with Early Stopping (patience = 15).
+**HelixPR** (helix-aware periodic representation + CNN) is included as a literature baseline, and the
+**Komlós–Hadamard** encoding can be used as input of GenExplorer.
 
 ---
 
-### 2. Configuration B ($C_2$ – FullE Ensemble Strategy)
+## Benchmarks
 
-* **Optimization Goal**: Standard multi-branch CNN training scheme.
-* **Loss Function**: Binary Cross-Entropy (BCE) Loss.
-* **Optimizer & Schedule**: Standard Adam ($lr = 1\times 10^{-3}$) with StepLR decay ($\gamma = 0.5$ every 5 epochs).
-* **Data Augmentation**: None (clean baseline sequence input).
-* **Training Protocol**: Fixed 30 epochs without early stopping.
+| Task (`--task`) | Name | Length | Description |
+| :--- | :--- | :---: | :--- |
+| `viral` | VM | 300 bp | Viral metagenomic reads (ViraMiner), ≈2% positives |
+| `viral` (test only) | SIM | 300 bp | VM test set with 1%, 5% and 10% substitution noise, 5 realizations per level |
+| `ecoli` | ECO | 81 bp | *E. coli* promoters, balanced |
+| `enhancer` | ENH | 200 bp | Human enhancers, balanced |
+| `anellovirus` | OOD | 300 bp | *Anelloviridae* excluded from training/validation and used only for testing |
 
----
+**Splits.** VM has its own training/validation/test files. ECO, ENH and OOD provide only training and test
+files: the training file is shuffled with the run seed and 20% is held out for validation, so each seed uses a
+different training/validation partition. All test sets are fixed.
 
-### 3. Configuration C ($C_3$ – Nucleic Transformer Strategy)
+### Data
 
-* **Optimization Goal**: Attention-focused optimization with token-level noise regularization.
-* **Loss Function**: Cross-Entropy (CE) Loss.
-* **Optimizer & Schedule**: Adam optimizer with Noam (AIAYN) inverse-square-root learning rate schedule and warmup steps.
-* **Data Augmentation**: Stochastic mutation augmentation ($K = \min(40, \lfloor 0.13 \cdot L \rfloor)$ nucleotide substitutions per sequence).
-* **Training Protocol**: Fixed 60 epochs without early stopping.
-* 
-### 4. Configuration D ($C_4$ – DNABERT-2 Strategy)
-
-* **Optimization Goal**: Foundation model fine-tuning with aggressive weight regularization.
-* **Loss Function**: Cross-Entropy/ BCE Loss.
-* **Optimizer & Schedule**:  AdamW ($lr = 5\times 10^{-5}$, weight decay $= 0.05$, gradient clipping at $0.8$) with a 10% linear warmup and Cosine schedule.
-* **Data Augmentation**:  Stochastic Reverse Complement ($p=0.5$) and random positional sequence shifts within $\pm 5\text{ bp}$.
-* **Training Protocol**:  Maximum 20 epochs with Early Stopping (patience = 8) and elevated dropout ($p=0.5$).
-
-
----
-
-## Benchmark Datasets & Tasks
-
-Models trained under each configuration are evaluated across 5 biological benchmarks:
-
-### DS-VM (Viral Metagenomic Benchmark)
-
-* **Task**: Identification of viral contigs from 300 bp NGS human biospecimen reads under severe class imbalance ($\approx 2\%$ viral positive vs $98\%$ host/bacterial background). 
-
-### DS-ECO (Bacterial Promoters - E. coli)
-
-* **Task**: Binary classification of 81 bp promoter sequences centered around Transcription Start Sites (TSS), benchmarked on RegulonDB and extended datasets (DNABERT2-CAMP).
-
-### DS-ENH (Human Enhancers)
-
-* **Task**: Functional annotation of 200 bp enhancer fragments across human cell lines.
-
-### DS-OOD (Out-of-Distribution Anellovirus)
-
-* **Task**: Sequences from the Anelloviridae family are excluded from training/validation and tested exclusively at inference to measure out-of-distribution taxonomic transfer.
-
-### DS-SIM (Synthetic Noise Robustness)
-
-* **Task**: Assessment of error tolerance by injecting uniform substitution noise at 1%, 5%, and 10% mutation levels into test sequences across 5 independent random seeds per corruption level.
-
----
-
-## Dual Execution Framework
-
-The repository supports two workflows depending on experimental and computational requirements.
-Both modes save prediction outputs as raw logit files:
-```
-Decoupled Mode: exports to global_logits/
-Pipeline Mode: exports to global_logits_monolithic/
-```
-using the unified naming convention:
-```
-{architecture}_cfg{CONFIG}_{task}_{evaluation_dataset}.txt
-```
-directory using a standardized organization based on:
-
-* **Architecture**
-
-  * `genexplorer`
-  * `fulle`
-  * `nucleictransformer`
-  * `dnabert2camp`
-
-* **Training Configuration**
-
-  * `cfgA`
-  * `cfgB`
-  * `cfgC`
-  * `cfgD`
-
-* **Training Task**
-
-  * `viral`
-  * `ecoli`
-  * `enhancer`
-  * `anellovirus`
-
-* **Evaluation Dataset**
-
-  * `test_VM`
-  * `test_ecoli`
-  * `test_enhancer`
-  * `test_anellovirus`
-  * `test_sim_noise_5_seed_5002`
-  
-```bash
-                        ┌───────────────────────────────┐
-                        │       EXECUTION OPTIONS       │
-                        └───────────────┬───────────────┘
-                                        │
-             ┌──────────────────────────┴──────────────────────────┐
-             ▼                                                     ▼
-┌─────────────────────────────┐                       ┌──────────────────────────────────────┐
-│ 1. DECOUPLED WORKFLOW       │                       │ 2. ALL-IN-ONE PIPELINES              │
-│ pipelines/train_<arch>.py   │                       │ pipelines/train_<arch>_pipeline.py   │
-└────────────┬────────────────┘                       └────────────┬─────────────────────────┘
-             │ Saves Checkpoint (.pt)                              │
-             ▼                                                     │
-┌─────────────────────────────┐                                    │
-│ evaluation/evaluate.py      │                                    │
-└────────────┬────────────────┘                                    │
-             │                                                     │
-             └──────────────────────────┬──────────────────────────┘
-                                        ▼ Exports Raw Logits (.txt)
-                             ┌─────────────────────┐
-                             │    global_logits/   │
-                             └──────────┬──────────┘
-                                        ▼ Input for Benchmark Synthesis
-                             ┌─────────────────────┐
-                             │ compute_metrics.py  │
-                             └─────────────────────┘
-
-```
-
-
-### Option 1: Decoupled Workflow (Modular)
-Isolates training from inference. Trains the chosen model on the specified task and configuration. It tracks validation performance (AUROC) at each epoch, applies early stopping when configured, and saves the optimal weight parameters to the `checkpoint` directory, while evaluate.py loads the saved .pt checkpoint file, detects the test set(s) mapped to the selected task, performs inference, displays test metrics (AUROC, AUPRC, MCC), and saves raw prediction logits to `logits`directory:
-```bash
-# Example: Train GenExplorer on E. coli under Configuration A (C1)
-python pipelines/train_genexplorer.py \
-    --config A \
-    --task ecoli \
-    --data_folder ./datasets \
-    --checkpoint_dir ./checkpoints
-
-
-# Example: Evaluate the trained GenExplorer checkpoint
-python evaluation/evaluate.py \
-    --arch genexplorer \
-    --task ecoli \
-    --config A \
-    --checkpoint ./checkpoints/best_genexplorer_ecoli_A.pt \
-    --data_folder ./datasets \
-    --logits_dir ./global_logits
-
-# Example: Train Nucleic Transformer on Viral Metagenomics (300 bp) under Strategy C (C3)
-python pipelines/train_nucleic_transformer.py \
-    --config C \
-    --task viral \
-    --data_folder ./datasets \
-    --checkpoint_dir ./checkpoints
-
-# Example: Evaluate Nucleic Transformer across all 16 Viral test sets (DS-VM + 15 DS-SIM noise sets)
-python evaluation/evaluate.py \
-    --arch nucleictransformer \
-    --task viral \
-    --config C \
-    --checkpoint ./checkpoints/best_nucleictransformer_viral_C.pt \
-    --data_folder ./datasets \
-    --logits_dir ./global_logits
-```
-
-### Option 2:All-in-One End-to-End Pipelines
-This workflow bundles training, model selection, and multi-dataset test inference into a single automated script execution. It is primarily designed for automated HPC batch jobs (sbatch), running unattended experiments where a single command handles the full lifecycle from raw data to final logit files.
-* *Automated Cascade Inference*: Upon completing training, the pipeline automatically detects and iterates through all matching test sets. 
-* *Direct Logit Export*: Prediction logits are written directly into global_logits/ with standard nomenclature described above.
+The archives in `datasets/` contain all benchmark files. Extract them in place:
 
 ```bash
-# 1. GenExplorer on Viral Metagenomics (Config A)
-# Evaluates on DS-VM and automatically cascades over all 15 DS-SIM noise sets (1%, 5%, 10%)
-python pipelines/train_genex_pipeline.py \
-    --config A \
-    --task viral \
-    --data_folder ./datasets
-
-# 2. Nucleic Transformer on Human Enhancers (Config C)
-# Evaluates directly on the independent enhancer test set
-python pipelines/train_nt_pipeline.py \
-    --config C \
-    --task enhancer \
-    --data_folder ./datasets
-
-# 3. DNABERT2-CAMP on Out-of-Distribution Anellovirus (Config A)
-# Evaluates generalization on unseen Anelloviridae families
-python pipelines/train_dnabert2_camp_pipeline.py \
-    --config A \
-    --task anellovirus \
-    --data_folder ./datasets
-
-# 4. FullE Ensemble on E. coli Promoters (Config B)
-# Trains frequency, pattern, and Lp-pooling branches, fits merger, and extracts test logits
-python pipelines/train_fulle_pipeline.py \
-    --config B \
-    --task ecoli \
-    --data_folder ./datasets
-
+cd datasets
+for z in *.zip; do unzip -o "$z"; done
+cd ..
 ```
+
+The loaders search `datasets/` (or the folder passed with `--data_folder` / `$DATA_DIR`) recursively, so the
+extracted folder names (`DNA_data/`, `SIM/`, `ecoli/`, `enhancer/`, `unseen_anell/`) can be kept as they are.
+
 ---
 
-## Cross-Configuration Evaluation
+## Training configurations
 
-Each architecture can be executed using any of the four optimization strategies described above.
+Each architecture is trained under four configurations, each derived from the native protocol of one
+architecture (`--config A|B|C|D` = C1–C4):
 
-Consequently, the benchmark supports two complementary analyses:
+| Config | Origin | Loss | Augmentation | Training length |
+| :--- | :--- | :--- | :--- | :--- |
+| A (C1) | GenExplorer | Focal loss ($\gamma=2$, label smoothing 0.05) | Reverse complement ($p=0.5$, not on ECO) + shift ±5 bp | Early stopping on validation AUROC |
+| B (C2) | FullE | BCE | none | Fixed number of epochs |
+| C (C3) | Nucleic Transformer | Cross-entropy (2 classes) | Online point mutation ($\min(40, \lfloor 0.13L \rfloor)$ positions) | Fixed number of epochs |
+| D (C4) | DNABERT-2 | Cross-entropy (2 classes) | none | Early stopping, gradient clipping 0.8 |
 
-* **Intra-architecture comparison**: Evaluates how a single architecture behaves under different optimization strategies.
-* **Cross-architecture comparison**: Evaluates different architectures trained under the same optimization strategy.
+Optimizers, learning rates, schedules, epochs and patience differ per architecture and are set in the
+training scripts (they are listed in the appendix of the paper). The focal-loss $\alpha$ is 0.75, except for the
+Nucleic Transformer, which sets it from the class frequencies of the training set (clipped to [0.5, 0.9]).
 
-This design enables a fair assessment of both architectural inductive biases and optimization strategies.
-To compute the comprehensive $4 \times 4$ metric tables (AUROC, AUPRC, MCC, Balanced Accuracy), noise degradation summaries, and inter-architectural ensemble voting, run:
+---
+
+## Installation
+
 ```bash
-python compute_metrics.py --dir_mod global_logits
+pip install -r requirements.txt
 ```
----
-Saving raw logits rather than only final metrics allows:
 
-* Reproducible post-hoc analyses.
-* Computation of new evaluation metrics without rerunning inference.
-* ROC and Precision–Recall curve generation.
-* Confidence interval estimation via bootstrapping.
-* Decision-level ensemble experiments.
-* Statistical significance testing between models.
-
-The analysis scripts operate directly on the stored logits, making experimentation significantly faster and fully reproducible.
+DNABERT2-CAMP needs `transformers` and, for the DNABERT-2 flash-attention kernels, `triton`. The pre-trained
+weights are downloaded from Hugging Face (`zhihan1996/DNABERT-2-117M`) unless `DNABERT2_MODEL_PATH` points
+to a local copy.
 
 ---
 
-## Determinism & Reproducibility
-Global random seed is fixed to 2020 across all data splitters, tokenizers, and PyTorch backends to guarantee reproducible replication of all experimental results.
+## Repository layout
 
+```
+models/        GenExplorer, GenExplorer ablation, FullE, Nucleic Transformer, DNABERT2-CAMP, HelixPR
+utils/         dataset splits and encodings (data_utils.py), pooling layers, HelixPR / Komlós encodings
+pipelines/     training scripts (one per architecture) + GE-T ablation + classical k-mer baselines
+evaluation/    evaluate.py (validation/test logits), summarize_auroc.py (AUROC tables)
+scripts/       benchmark and ablation launchers, Slurm template
+datasets/      benchmark archives
+```
+
+---
+
+## Usage
+
+### 1. Single model: train, then evaluate
+
+```bash
+# Train GenExplorer on ECO under C1
+python pipelines/train_genexplorer.py --task ecoli --config A --seed 2020 \
+    --data_folder ./datasets --checkpoint_dir ./checkpoints_seed_2020
+
+# Validation + test logits (for viral: VM test and the 15 SIM sets)
+python evaluation/evaluate.py --arch genexplorer --task ecoli --config A --seed 2020 \
+    --checkpoint ./checkpoints_seed_2020/best_genexplorer_ecoli_A.pt \
+    --data_folder ./datasets \
+    --logits_dir ./global_logits_2020 --val_logits_dir ./global_logits_val_2020
+```
+
+Training scripts: `train_genexplorer.py`, `train_fulle.py`, `train_nucleic_transformer.py`,
+`train_dnabert2_camp.py`, `train_helixpr.py`. `--arch` values for `evaluate.py`: `genexplorer`, `fulle`,
+`nucleictransformer`, `dnabert2camp`, `helixpr`.
+
+Use the same `--seed` for training and evaluation: on ECO, ENH and OOD it also defines the validation split.
+
+### 2. Full grid for one architecture and one seed
+
+```bash
+ARCH=genexplorer SEED=2020 bash scripts/run_benchmark.sh
+ARCH=helixpr     SEED=2020 bash scripts/run_benchmark.sh      # HelixPR: config A only
+ARCH=fulle SEED=1969 TASKS="ecoli enhancer" CONFIGS="A B" bash scripts/run_benchmark.sh
+```
+
+The launcher trains and evaluates every (task, configuration) pair, skips pairs whose logits already exist and
+restarts interrupted trainings. Other variables: `DATA_DIR`, `OUT_DIR`, `PYTHON`, `DNABERT2_PYTHON`
+(e.g. a container wrapper for DNABERT2-CAMP), `EXTRA_TRAIN_ARGS`.
+
+On a Slurm cluster, adapt the header and the variables of `scripts/slurm/run_benchmark.slurm`, then:
+
+```bash
+mkdir -p logs
+sbatch --export=ALL,ARCH=genexplorer,SEED=2020 scripts/slurm/run_benchmark.slurm
+```
+
+The paper uses seeds 2020 (main experiments), 1969 and 1933.
+
+### 3. Ablations and classical baselines
+
+```bash
+bash scripts/run_ablations.sh c1          # C1 on ECO/ENH: with RC, without RC, focal alpha = 0.5
+bash scripts/run_ablations.sh get         # GE-T: GenExplorer without the TransformerBranch
+bash scripts/run_ablations.sh classical   # k-mer frequencies + logistic regression / random forest
+```
+
+Reverse complement and focal $\alpha$ can also be set directly on the training scripts:
+`--rc auto|on|off` (default `auto`: off on ECO) and `--focal_alpha` (C1).
+
+### 4. AUROC tables
+
+```bash
+python evaluation/summarize_auroc.py --seed 2020 \
+    --logits_dir global_logits_2020 --val_logits_dir global_logits_val_2020
+```
+
+---
+
+## Output files
+
+```
+checkpoints_seed_<seed>/best_<arch>_<task>_<cfg>.pt
+global_logits_<seed>/<arch>_cfg<cfg>_<task>_test_<split>.txt
+global_logits_val_<seed>/<arch>_cfg<cfg>_<task>_val.txt        (viral: _val_VM.txt)
+```
+
+with `<split>` = `VM`, `ecoli`, `enhancer`, `anellovirus` or `sim_noise_<n>_seed_<s>_fullset_test`.
+Each logit file has one score per line, in the order of the corresponding CSV file. For configurations
+A and B the score is the logit of the positive class; for C and D it is $z_1 - z_0$, so that a sigmoid gives
+the same probability as the softmax.
+
+Ensembles, normalizations and statistical analyses are computed from these files.
+
+---
+
+## Reproducibility
+
+Seeds fix the data partition, the initialization and the data order. GPU training is not bit-wise
+deterministic (cuDNN kernels, floating-point non-associativity), so repeated runs with the same seed can
+differ slightly; the paper reports mean ± standard deviation over three seeds.

@@ -1,6 +1,22 @@
 """
-Shared data utilities with length-variable masking, physical representation support,
-and paper-compliant online data augmentation.
+Shared data utilities: benchmark splits, input encodings (one-hot, HelixPR,
+Komlós-Hadamard, DNABERT-2 tokens) and the online data augmentation of each
+training configuration.
+
+Splits
+------
+VM uses the training/validation/test files of the original benchmark.
+ECO, ENH and OOD provide only training and test files: the training file is
+shuffled with the run seed and its first 20% is held out for validation, so
+each seed uses a different training/validation partition. Test sets are fixed.
+
+Augmentation (training only, one-hot inputs)
+--------------------------------------------
+Config A (C1): reverse complement with p=0.5 and a random shift of +-5 bp.
+               Reverse complement is disabled by default on ECO, whose
+               promoters are strand-oriented (see `use_rc`).
+Config C (C3): online point mutation (not for the Nucleic Transformer, which
+               applies its own mutation inside the training loop).
 """
 
 import os
@@ -13,12 +29,21 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from utils.representations import encode_physhelical, get_dataset_period
+from utils.representations import encode_helixpr, encode_komlos, get_dataset_period
 from utils.pooling import compute_length_feature
 
 MAPPING_4D = {"A": [1, 0, 0, 0], "C": [0, 1, 0, 0], "G": [0, 0, 1, 0], "T": [0, 0, 0, 1], "N": [0, 0, 0, 0]}
 MAPPING_5D = {"A": [1, 0, 0, 0, 0], "C": [0, 1, 0, 0, 0], "G": [0, 0, 1, 0, 0], "T": [0, 0, 0, 1, 0], "N": [0, 0, 0, 0, 1]}
 NUC_TO_ID = {"A": 0, "C": 1, "G": 2, "T": 3, "N": 0}
+
+
+RC_CHOICES = ("auto", "on", "off")
+
+
+def parse_rc(value: str) -> Optional[bool]:
+    """Command-line value of --rc -> `use_rc` of SequenceClassificationDataset.
+    auto: reverse complement in config A except on ECO (default); on/off: forced."""
+    return {"auto": None, "on": True, "off": False}[value]
 
 
 def seed_everything(seed: int = 2020) -> None:
@@ -127,44 +152,6 @@ def resolve_task_splits(task: str, data_folder: str, seed: int = 2020) -> Tuple[
         if test_p:
             cascade_test_paths["test_anellovirus"] = test_p
 
-    elif task == "basith":
-        seq_len = 2000
-        subdirs = ["basith", "enhancer", ""]
-        train_p = find_file_scoped(data_folder, subdirs, ["basith_train.csv"])
-        test_p = find_file_scoped(data_folder, subdirs, ["basith_test.csv"])
-        if not train_p:
-            raise FileNotFoundError(f"Basith dataset non trovato in {data_folder}")
-        full_df = load_seq_label_dataframe(train_p).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-        n_val = int(len(full_df) * 0.2)
-        val_df = full_df.iloc[:n_val].reset_index(drop=True)
-        train_df = full_df.iloc[n_val:].reset_index(drop=True)
-        if test_p:
-            cascade_test_paths["test_basith"] = test_p
-
-    elif task == "cohn":
-        seq_len = 500
-        subdirs = ["cohn", "enhancer", ""]
-        train_p = find_file_scoped(data_folder, subdirs, ["cohn_train.csv"])
-        test_p = find_file_scoped(data_folder, subdirs, ["cohn_test.csv"])
-        full_df = load_seq_label_dataframe(train_p).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-        n_val = int(len(full_df) * 0.2)
-        val_df = full_df.iloc[:n_val].reset_index(drop=True)
-        train_df = full_df.iloc[n_val:].reset_index(drop=True)
-        if test_p:
-            cascade_test_paths["test_cohn"] = test_p
-
-    elif task in ["modomics", "rna_mod"]:
-        seq_len = 41
-        subdirs = ["modomics", "MODOMICS", ""]
-        train_p = find_file_scoped(data_folder, subdirs, ["modomics_train.csv", "MODOMICS_train.csv"])
-        test_p = find_file_scoped(data_folder, subdirs, ["modomics_test.csv", "MODOMICS_test.csv"])
-        full_df = load_seq_label_dataframe(train_p).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-        n_val = int(len(full_df) * 0.2)
-        val_df = full_df.iloc[:n_val].reset_index(drop=True)
-        train_df = full_df.iloc[n_val:].reset_index(drop=True)
-        if test_p:
-            cascade_test_paths["test_modomics"] = test_p
-
     else:
         raise ValueError(f"Unknown task: {task}")
 
@@ -212,9 +199,12 @@ class SequenceClassificationDataset(Dataset):
         tokenizer=None,
         task: str = "viral",
         input_rep: str = "onehot",
-        period_T: Optional[float] = None
+        period_T: Optional[float] = None,
+        use_rc: Optional[bool] = None,
     ):
         self.task = task.lower()
+        # Reverse complement (config A only): on by default, off on ECO.
+        self.use_rc = (self.task != "ecoli") if use_rc is None else bool(use_rc)
         self.input_rep = input_rep.lower()
         self.period_T = period_T
         self.sequences = sequences
@@ -232,7 +222,9 @@ class SequenceClassificationDataset(Dataset):
         seq = str(self.sequences[idx]).upper().strip()
         if self.is_train and self.input_rep == "onehot":
             if self.config == "A":
-                if random.random() < 0.5:
+                # The random draw is kept even when RC is disabled, so that the
+                # random stream of the positional shift is the same in both cases.
+                if random.random() < 0.5 and self.use_rc:
                     seq = reverse_complement(seq)
                 seq = positional_shift(seq, max_shift=5)
             elif self.config == "C":
@@ -240,11 +232,14 @@ class SequenceClassificationDataset(Dataset):
                     seq = mutate_sequence(seq)
         real_len = min(len(seq), self.target_len)
 
-        is_phys = (self.input_rep == "physhelical" and self.arch in ["sequencecnn", "genexplorer", "fulle"])
-        eff_len = (self.target_len + 1) if is_phys else self.target_len
+        is_phys_or_helix = (
+            (self.input_rep == "helixpr" or self.arch == "helixpr")
+            and self.arch in ["genexplorer", "fulle", "helixpr"]
+        )
+        eff_len = (self.target_len + 1) if is_phys_or_helix else self.target_len
 
         mask = np.zeros(eff_len, dtype=np.float32)
-        if is_phys:
+        if is_phys_or_helix:
             mask[:real_len + 1] = 1.0
         else:
             mask[:real_len] = 1.0
@@ -274,7 +269,28 @@ class SequenceClassificationDataset(Dataset):
                 "label": target_tensor
             }
 
-        elif self.arch == "fulle" and not is_phys:
+        elif self.arch == "helixpr" or self.input_rep == "helixpr":
+            t_val = self.period_T if self.period_T is not None else get_dataset_period(self.task)
+            enc = encode_helixpr(seq, period_T=t_val, alpha=0.05, include_cls=True, target_len=self.target_len)
+            target_tensor = torch.tensor(int(y), dtype=torch.long) if self.config in ["C", "D"] else torch.tensor(y, dtype=torch.float32)
+            return {
+                "data": torch.tensor(enc, dtype=torch.float32),
+                "mask": torch.tensor(mask, dtype=torch.float32),
+                "len_feat": torch.tensor(len_feat, dtype=torch.float32),
+                "label": target_tensor
+            }
+
+        elif self.input_rep == "komlos":
+            enc = encode_komlos(seq, target_len=self.target_len)
+            target_tensor = torch.tensor(int(y), dtype=torch.long) if self.config in ["C", "D"] else torch.tensor(y, dtype=torch.float32)
+            return {
+                "data": torch.tensor(enc, dtype=torch.float32),
+                "mask": torch.tensor(mask, dtype=torch.float32),
+                "len_feat": torch.tensor(len_feat, dtype=torch.float32),
+                "label": target_tensor
+            }
+
+        elif self.arch == "fulle" and not is_phys_or_helix:
             enc = [MAPPING_5D.get(b, [0, 0, 0, 0, 1]) for b in seq[:self.target_len]]
             while len(enc) < self.target_len:
                 enc.append([0, 0, 0, 0, 1])
@@ -286,13 +302,9 @@ class SequenceClassificationDataset(Dataset):
             }
 
         else:
-            if is_phys:
-                t_val = self.period_T if self.period_T is not None else get_dataset_period(self.task)
-                enc = encode_physhelical(seq, period_T=t_val, target_len=self.target_len)
-            else:
-                enc = [MAPPING_4D.get(b, [0, 0, 0, 0]) for b in seq[:self.target_len]]
-                while len(enc) < self.target_len:
-                    enc.append([0, 0, 0, 0])
+            enc = [MAPPING_4D.get(b, [0, 0, 0, 0]) for b in seq[:self.target_len]]
+            while len(enc) < self.target_len:
+                enc.append([0, 0, 0, 0])
 
             target_tensor = torch.tensor(int(y), dtype=torch.long) if self.config in ["C", "D"] else torch.tensor(y, dtype=torch.float32)
             return {
