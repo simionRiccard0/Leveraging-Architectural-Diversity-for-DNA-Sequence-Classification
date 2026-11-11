@@ -26,7 +26,15 @@ Code for the benchmark of four deep learning paradigms for DNA sequence classifi
 
 **Splits.** VM has its own training/validation/test files. ECO, ENH and OOD provide only training and test
 files: the training file is shuffled with the run seed and 20% is held out for validation, so each seed uses a
-different training/validation partition. All test sets are fixed.
+different training/validation partition. The VM, SIM and OOD test sets are fixed.
+
+**Leakage-free ECO and ENH.** The original ECO and ENH test sets share sequences with the training files (all
+466 ECO test negatives and 100 of the 200 ENH test enhancers are exact duplicates of training sequences). The
+paper therefore uses rebuilt splits, one per seed (2020, 1969, 1933), released in `datasets_leakfree/`:
+training and test sequences were pooled, an all-against-all blastn search grouped similar sequences
+(identity ≥ 80% over ≥ 80% of the shorter sequence) into clusters, and whole clusters were assigned to the
+test set until it reached the original size and class composition (ECO: 461 + 466; ENH: 200 + 200). A final
+blastn search of each training file against its test set returns no hit. See [Leakage-free splits](#leakage-free-eco-and-enh-splits).
 
 ### Data
 
@@ -40,6 +48,38 @@ cd ..
 
 The loaders search `datasets/` (or the folder passed with `--data_folder` / `$DATA_DIR`) recursively, so the
 extracted folder names (`DNA_data/`, `SIM/`, `ecoli/`, `enhancer/`, `unseen_anell/`) can be kept as they are.
+
+The `ecoli/` and `enhancer/` archives contain the **original** files. The ECO and ENH results of the paper use
+the leakage-free splits in `datasets_leakfree/` (see below).
+
+### Leakage-free ECO and ENH splits
+
+```
+datasets_leakfree/seed_<seed>/ECO_train.txt   5,247 sequences (2,853 promoters, 2,394 non-promoters)
+datasets_leakfree/seed_<seed>/ECO_test.txt      927 sequences (461 promoters, 466 non-promoters)
+datasets_leakfree/seed_<seed>/ENH_train.txt   2,868 sequences (1,384 enhancers, 1,484 non-enhancers)
+datasets_leakfree/seed_<seed>/ENH_test.txt      400 sequences (200 enhancers, 200 non-enhancers)
+```
+
+Tab-separated text with a `sequence  label` header; the sizes are the same for the three seeds, the content of
+the test sets is different. Each run uses the split of its own seed, and holds out 20% of `*_train.txt` for
+validation (the first 20% after `DataFrame.sample(frac=1, random_state=seed)`).
+
+Convert them to the layout read by the training scripts, then point `DATA_DIR` to the folder of the run seed:
+
+```bash
+python scripts/data/prepare_leakfree.py            # -> datasets_leakfree_csv/seed_<seed>/{ecoli,enhancer}/
+for SEED in 2020 1969 1933; do
+  DATA_DIR=datasets_leakfree_csv/seed_$SEED SEED=$SEED TASKS="ecoli enhancer" ARCH=genexplorer \
+      bash scripts/run_benchmark.sh
+done
+```
+
+The splits can be regenerated from the original archives with `scripts/data/resplit.py` (requires BLAST+):
+
+```bash
+python scripts/data/resplit.py --data datasets --out datasets_leakfree_csv --no_priority --threads 8
+```
 
 ---
 
@@ -80,8 +120,9 @@ models/        GenExplorer, GenExplorer ablation, FullE, Nucleic Transformer, DN
 utils/         dataset splits and encodings (data_utils.py), pooling layers, HelixPR / Komlós encodings
 pipelines/     training scripts (one per architecture) + GE-T ablation + classical k-mer baselines
 evaluation/    evaluate.py (validation/test logits), summarize_auroc.py (AUROC tables)
-scripts/       benchmark and ablation launchers, Slurm template
-datasets/      benchmark archives
+scripts/       benchmark and ablation launchers, Slurm template; data/: leakage-free splits (resplit.py, prepare_leakfree.py)
+datasets/      benchmark archives (original files)
+datasets_leakfree/  leakage-free ECO and ENH splits used in the paper (one folder per seed)
 ```
 
 ---
