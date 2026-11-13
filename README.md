@@ -34,7 +34,8 @@ paper therefore uses rebuilt splits, one per seed (2020, 1969, 1933), released i
 training and test sequences were pooled, an all-against-all blastn search grouped similar sequences
 (identity ≥ 80% over ≥ 80% of the shorter sequence) into clusters, and whole clusters were assigned to the
 test set until it reached the original size and class composition (ECO: 461 + 466; ENH: 200 + 200). A final
-blastn search of each training file against its test set returns no hit. See [Leakage-free splits](#leakage-free-eco-and-enh-splits).
+blastn search of each training file against its test set returns no hit. Training, validation and
+test sets are released separately for each seed. See [Leakage-free splits](#leakage-free-eco-and-enh-splits).
 
 ### Data
 
@@ -55,15 +56,22 @@ the leakage-free splits in `datasets_leakfree/` (see below).
 ### Leakage-free ECO and ENH splits
 
 ```
-datasets_leakfree/seed_<seed>/ECO_train.txt   5,247 sequences (2,853 promoters, 2,394 non-promoters)
-datasets_leakfree/seed_<seed>/ECO_test.txt      927 sequences (461 promoters, 466 non-promoters)
-datasets_leakfree/seed_<seed>/ENH_train.txt   2,868 sequences (1,384 enhancers, 1,484 non-enhancers)
-datasets_leakfree/seed_<seed>/ENH_test.txt      400 sequences (200 enhancers, 200 non-enhancers)
+datasets_leakfree/seed_<seed>/ECO_trainval.txt  5,247 sequences (2,853 promoters, 2,394 non-promoters)
+datasets_leakfree/seed_<seed>/ECO_train.txt     4,198 sequences   (80% of ECO_trainval.txt)
+datasets_leakfree/seed_<seed>/ECO_val.txt       1,049 sequences   (20% of ECO_trainval.txt)
+datasets_leakfree/seed_<seed>/ECO_test.txt        927 sequences (461 promoters, 466 non-promoters)
+datasets_leakfree/seed_<seed>/ENH_trainval.txt  2,868 sequences (1,384 enhancers, 1,484 non-enhancers)
+datasets_leakfree/seed_<seed>/ENH_train.txt     2,295 sequences   (80% of ENH_trainval.txt)
+datasets_leakfree/seed_<seed>/ENH_val.txt         573 sequences   (20% of ENH_trainval.txt)
+datasets_leakfree/seed_<seed>/ENH_test.txt        400 sequences (200 enhancers, 200 non-enhancers)
 ```
 
 Tab-separated text with a `sequence  label` header; the sizes are the same for the three seeds, the content of
-the test sets is different. Each run uses the split of its own seed, and holds out 20% of `*_train.txt` for
-validation (the first 20% after `DataFrame.sample(frac=1, random_state=seed)`).
+the splits is different. `*_train.txt`, `*_val.txt` and `*_test.txt` are exactly the training, validation and
+test sets used in the paper for that seed, and they are disjoint. `*_trainval.txt` is the training file of the
+resplit: the training scripts read it and hold out its first 20% after
+`DataFrame.sample(frac=1, random_state=seed)`, which reproduces `*_val.txt`. The order of the sequences in
+`*_val.txt` and `*_test.txt` is the order of the saved logits.
 
 Convert them to the layout read by the training scripts, then point `DATA_DIR` to the folder of the run seed:
 

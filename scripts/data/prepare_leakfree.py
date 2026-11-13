@@ -6,8 +6,9 @@ Output: <out>/seed_<seed>/ecoli/{ecoli_train_NT.csv, ecoli_independent_test_NT.c
         <out>/seed_<seed>/enhancer/{bert_enhancer_dataset.csv, bert_enhancer_ind_test_set.csv}
 Each run must use the folder of its own seed, e.g.
     DATA_DIR=datasets_leakfree_csv/seed_2020 SEED=2020 TASKS="ecoli enhancer" ARCH=fulle bash scripts/run_benchmark.sh
-The validation set is the first 20% of the training file after shuffling it with the run seed
-(pandas DataFrame.sample(frac=1, random_state=seed)), as for the original benchmarks.
+The training scripts read *_trainval.txt and hold out the first 20% after shuffling it with the run seed
+(pandas DataFrame.sample(frac=1, random_state=seed)), as for the original benchmarks; this hold-out is
+exactly the one released in *_val.txt, and the remaining 80% is *_train.txt.
 
 Usage: python scripts/data/prepare_leakfree.py [--src datasets_leakfree] [--out datasets_leakfree_csv]
 """
@@ -18,9 +19,9 @@ import os
 import pandas as pd
 
 FILES = {
-    "ECO_train.txt": "ecoli/ecoli_train_NT.csv",
+    "ECO_trainval.txt": "ecoli/ecoli_train_NT.csv",
     "ECO_test.txt": "ecoli/ecoli_independent_test_NT.csv",
-    "ENH_train.txt": "enhancer/bert_enhancer_dataset.csv",
+    "ENH_trainval.txt": "enhancer/bert_enhancer_dataset.csv",
     "ENH_test.txt": "enhancer/bert_enhancer_ind_test_set.csv",
 }
 

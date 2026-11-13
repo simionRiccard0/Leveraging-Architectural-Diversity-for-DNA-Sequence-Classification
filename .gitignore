@@ -1,5 +1,6 @@
 # Extracted datasets (the archives in datasets/*.zip are tracked)
 datasets/*/
+datasets_leakfree_csv/
 *.csv
 *.tsv
 
